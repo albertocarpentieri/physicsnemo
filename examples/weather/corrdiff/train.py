@@ -681,7 +681,6 @@ def main(cfg: DictConfig) -> None:
                                         "img_clean": img_clean_valid,
                                         "img_lr": img_lr_valid,
                                         "augment_pipe": None,
-                                        "use_patch_grad_acc": use_patch_grad_acc,
                                     }
                                     if use_patch_grad_acc is not None:
                                         loss_valid_kwargs[
