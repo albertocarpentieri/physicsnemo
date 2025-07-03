@@ -555,7 +555,7 @@ class SongUNet(Module):
                             if x.shape[-1] > self.checkpoint_threshold:
                                 # self.checkpoint = checkpoint?
                                 # else: self.checkpoint  = lambda(block,x,emb:block(x,emb))
-                                x = checkpoint(block, x, emb)
+                                x = checkpoint(block, x, emb, use_reentrant=False)
                             else:
                                 # AssertionError: Only support NHWC layout.
                                 x = block(x, emb)
@@ -589,7 +589,7 @@ class SongUNet(Module):
                             x.shape[-1] > (self.checkpoint_threshold / 2)
                             and "_up" in name
                         ):
-                            x = checkpoint(block, x, emb)
+                            x = checkpoint(block, x, emb, use_reentrant=False)
                         else:
                             x = block(x, emb)
             return aux
