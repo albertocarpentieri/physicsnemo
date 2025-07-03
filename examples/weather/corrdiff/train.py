@@ -325,6 +325,7 @@ def main(cfg: DictConfig) -> None:
             find_unused_parameters=True,  # dist.find_unused_parameters,
             bucket_cap_mb=35,
             gradient_as_bucket_view=True,
+            static_graph=True
         )
     if cfg.wandb.watch_model and dist.rank == 0:
         wandb.watch(model)
