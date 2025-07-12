@@ -17,7 +17,7 @@
 import numpy as np
 import pyvista as pv
 from scipy.interpolate import griddata
-from typing import List, Dict, Tuple
+from typing import List, Dict
 
 
 def midpoint_data_interp(
