@@ -1147,10 +1147,10 @@ class SongUNetPosEmbd(SongUNet):
             )  # (N_grid_channels, img_shape_y, img_shape_x)
             grid.requires_grad = False
         elif self.gridtype == "test" and self.N_grid_channels == 2:
-            idx_x = torch.arange(self.img_shape_y)
-            idx_y = torch.arange(self.img_shape_x)
-            mesh_x, mesh_y = torch.meshgrid(idx_x, idx_y)
-            grid = torch.stack((mesh_x, mesh_y), dim=0)  # (2, img_shape_y, img_shape_x)
+            idx_x = torch.arange(self.img_shape_x)
+            idx_y = torch.arange(self.img_shape_y)
+            mesh_y, mesh_x = torch.meshgrid(idx_y, idx_x)
+            grid = torch.stack((mesh_y, mesh_x), dim=0)  # (2, img_shape_y, img_shape_x)
         else:
             raise ValueError("Gridtype not supported.")
         return grid
