@@ -336,7 +336,7 @@ class SongUNet(Module):
             self.img_shape_x = img_resolution[1]
 
         # set the threshold for checkpointing based on image resolution
-        self.checkpoint_threshold = (self.img_shape_x >> checkpoint_level) + 1
+        self.checkpoint_threshold = (self.img_shape_y >> checkpoint_level) + 1
 
         # Optional additive learned positition embed after the first conv
         self.additive_pos_embed = additive_pos_embed
