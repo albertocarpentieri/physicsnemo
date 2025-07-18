@@ -15,12 +15,12 @@
 # limitations under the License.
 
 import contextlib
+import math
 from dataclasses import dataclass
 from typing import Callable, List, Literal, Optional, Set, Union
 
 import numpy as np
 import nvtx
-import math
 import torch
 from torch.nn.functional import silu
 from torch.utils.checkpoint import checkpoint
@@ -337,7 +337,10 @@ class SongUNet(Module):
             self.img_shape_x = img_resolution[1]
 
         # set the threshold for checkpointing based on image resolution
-        self.checkpoint_threshold = (math.floor(math.sqrt(self.img_shape_x * self.img_shape_y)) >> checkpoint_level) + 1
+        self.checkpoint_threshold = (
+            math.floor(math.sqrt(self.img_shape_x * self.img_shape_y))
+            >> checkpoint_level
+        ) + 1
 
         # Optional additive learned positition embed after the first conv
         self.additive_pos_embed = additive_pos_embed
@@ -553,7 +556,10 @@ class SongUNet(Module):
                     else:
                         # For UNetBlocks check if we should use gradient checkpointing
                         if isinstance(block, UNetBlock):
-                            if math.floor(math.sqrt(x.shape[-2] * x.shape[-1])) > self.checkpoint_threshold:
+                            if (
+                                math.floor(math.sqrt(x.shape[-2] * x.shape[-1]))
+                                > self.checkpoint_threshold
+                            ):
                                 # self.checkpoint = checkpoint?
                                 # else: self.checkpoint  = lambda(block,x,emb:block(x,emb))
                                 x = checkpoint(block, x, emb, use_reentrant=False)
@@ -585,9 +591,12 @@ class SongUNet(Module):
                             x = torch.cat([x, skips.pop()], dim=1)
                         # check for checkpointing on decoder blocks and up sampling blocks
                         if (
-                            math.floor(math.sqrt(x.shape[-2] * x.shape[-1])) > self.checkpoint_threshold and "_block" in name
+                            math.floor(math.sqrt(x.shape[-2] * x.shape[-1]))
+                            > self.checkpoint_threshold
+                            and "_block" in name
                         ) or (
-                            math.floor(math.sqrt(x.shape[-2] * x.shape[-1])) > (self.checkpoint_threshold / 2)
+                            math.floor(math.sqrt(x.shape[-2] * x.shape[-1]))
+                            > (self.checkpoint_threshold / 2)
                             and "_up" in name
                         ):
                             x = checkpoint(block, x, emb, use_reentrant=False)
@@ -1127,7 +1136,9 @@ class SongUNetPosEmbd(SongUNet):
             y2 = np.meshgrid(np.cos(np.linspace(0, 2 * np.pi, self.img_shape_y)))
             grid_y1, grid_x1 = np.meshgrid(x1, y1)
             grid_y2, grid_x2 = np.meshgrid(x2, y2)
-            grid = torch.from_numpy(np.stack((grid_x1, grid_y1, grid_x2, grid_y2), axis=0))
+            grid = torch.from_numpy(
+                np.stack((grid_x1, grid_y1, grid_x2, grid_y2), axis=0)
+            )
             grid.requires_grad = False
         elif self.gridtype == "sinusoidal" and self.N_grid_channels != 4:
             if self.N_grid_channels % 4 != 0:
