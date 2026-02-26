@@ -25,8 +25,8 @@ from makani.utils import comm
 
 # layer normalization
 from physicsnemo.distributed.mappings import scatter_to_parallel_region, gather_from_parallel_region
-from ..meta import ModelMetaData
-from ..module import Module
+from physicsnemo.core import ModelMetaData
+from physicsnemo.core import Module
 from dataclasses import dataclass
 
 # heuristic for finding theta_cutoff
