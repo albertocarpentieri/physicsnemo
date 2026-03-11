@@ -343,6 +343,13 @@ class Trainer:
             )
         else:
             self.invariant_tensor = None
+            if (
+                "invariant" in self.cfg.model.diffusion_conditions
+                or "invariant" in self.cfg.model.regression_conditions
+            ):
+                self.logger.info(
+                    "Invariant conditions specified in model configuration, but dataset provides no invariants. Ignoring invariant conditions."
+                )
 
         if (
             self.cfg.model.architecture != "dit"
@@ -394,10 +401,9 @@ class Trainer:
                 img_resolution=self.dataset_train.image_shape(),
                 target_channels=len(self.state_channels),
                 conditional_channels=num_condition_channels,
-                spatial_embedding=model_cfg.spatial_pos_embed,
-                attn_resolutions=model_cfg.attn_resolutions,
                 lead_time_steps=self.lead_time_steps,
                 amp_mode=self.enable_amp,
+                use_apex_gn=self.use_apex_gn,
                 **model_cfg.hyperparameters,
             )
         elif model_cfg.architecture == "dit":

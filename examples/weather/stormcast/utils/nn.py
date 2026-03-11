@@ -37,14 +37,12 @@ def get_preconditioned_unet(
     name: str,
     target_channels: int,
     conditional_channels: int = 0,
-    spatial_embedding: bool = True,
     img_resolution: tuple = (512, 640),
     model_type: str | None = None,
-    channel_mult: list = [1, 2, 2, 2, 2],
-    attn_resolutions: list = [],
     lead_time_steps: int = 0,
     lead_time_channels: int = 4,
     amp_mode: bool = False,
+    use_apex_gn: bool = False,
     **model_kwargs,
 ) -> EDMPrecond | StormCastUNet:
     """
@@ -54,13 +52,12 @@ def get_preconditioned_unet(
         name: 'regression' or 'diffusion' to select between either model type
         target_channels: The number of channels in the target
         conditional_channels: The number of channels in the conditioning
-        spatial_embedding: whether or not to use the additive spatial embedding in the U-Net
         img_resolution: resolution of the data (U-Net inputs/outputs)
         model_type: the model class to use, or None to select it automatically
-        channel_mult: the channel multipliers for the different levels of the U-Net
-        attn_resolutions: resolution of internal U-Net stages to use self-attention
         lead_time_steps: the number of possible lead time steps, if 0 lead time embedding will be disabled
         lead_time_channels: the number of channels to use for each lead time embedding
+        amp_mode: whether to use automatic mixed precision
+        use_apex_gn: whether to use Apex GroupNorm
     Returns:
         EDMPrecond or StormCastUNet: a wrapped torch module net(x+n, sigma, condition, class_labels) -> x
     """
@@ -72,10 +69,8 @@ def get_preconditioned_unet(
         "img_resolution": img_resolution,
         "img_out_channels": target_channels,
         "model_type": model_type,
-        "channel_mult": channel_mult,
-        "attn_resolutions": attn_resolutions,
-        "additive_pos_embed": spatial_embedding,
         "amp_mode": amp_mode,
+        "use_apex_gn": use_apex_gn,
     }
     model_params.update(model_kwargs)
 
