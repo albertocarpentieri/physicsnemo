@@ -440,7 +440,7 @@ class ParallelHelper:
 
             placement = (
                 Shard(shard_dim)
-                if (x.ndim >= 3 and shard_dim is not None)
+                if (x.ndim >= 3 and shard_dim is not None and x.shape[shard_dim] > 1)
                 else Replicate()
             )
             x = scatter_tensor(
