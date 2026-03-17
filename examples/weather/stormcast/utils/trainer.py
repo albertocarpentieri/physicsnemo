@@ -182,6 +182,7 @@ class Trainer:
 
         # Loss function
         self.loss_fn = self._setup_loss()
+        self._setup_sigma_bin_tracking()
 
         # Training state
         self.train_steps = 0
@@ -542,6 +543,43 @@ class Trainer:
 
         return (optimizer, scheduler)
 
+    def _setup_sigma_bin_tracking(self) -> None:
+        """Configure optional diffusion sigma-bin loss diagnostics."""
+        loss_cfg = self.cfg.training.loss
+        self.track_sigma_bin_loss = (
+            self.loss_type != "regression" and bool(loss_cfg.track_sigma_bin_loss)
+        )
+        self.sigma_bin_edges = None
+        if not self.track_sigma_bin_loss:
+            return
+
+        if len(loss_cfg.sigma_bin_edges) >= 2:
+            edges = np.asarray(loss_cfg.sigma_bin_edges, dtype=np.float64)
+        else:
+            n_edges = int(loss_cfg.sigma_bin_count) + 1
+            if loss_cfg.sigma_distribution == "loguniform":
+                # Equal-probability bins for loguniform are uniform in log(sigma).
+                q = np.linspace(0.0, 1.0, n_edges, dtype=np.float64)
+                log_lo = float(np.log(loss_cfg.sigma_min))
+                log_hi = float(np.log(loss_cfg.sigma_max))
+                edges = np.exp(log_lo + q * (log_hi - log_lo))
+            else:
+                # Equal-probability bins for lognormal via quantiles:
+                # log(sigma) ~ N(P_mean, P_std^2).
+                q = torch.linspace(0.0, 1.0, n_edges, dtype=torch.float64)
+                q = q.clamp(1e-6, 1.0 - 1e-6)  # avoid infinities at 0 and 1
+                z = torch.distributions.Normal(0.0, 1.0).icdf(q)
+                log_edges = float(loss_cfg.P_mean) + float(loss_cfg.P_std) * z
+                edges = torch.exp(log_edges).cpu().numpy()
+
+        self.sigma_bin_edges = torch.as_tensor(
+            edges, dtype=torch.float32, device=self.device
+        )
+        self.logger.info(
+            "Sigma-bin loss tracking enabled with edges: "
+            f"{[float(x) for x in self.sigma_bin_edges.detach().cpu().tolist()]}"
+        )
+
     def _resume_or_init(
         self,
         net: Module,
@@ -623,6 +661,10 @@ class Trainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss = None
         channelwise_loss = torch.zeros((), device=self.device, requires_grad=False)
+        if self.track_sigma_bin_loss:
+            n_bins = int(self.sigma_bin_edges.numel() - 1)
+            sigma_bin_loss_sum = torch.zeros(n_bins, device=self.device, dtype=torch.float32)
+            sigma_bin_count = torch.zeros(n_bins, device=self.device, dtype=torch.float32)
 
         for _ in range(self.num_accumulation_rounds):
             batch = next(self.dataset_iterator)
@@ -646,16 +688,42 @@ class Trainer:
                 loss_kwargs = {}
                 if lead_time_label is not None:
                     loss_kwargs["lead_time_label"] = lead_time_label
-                loss = self.loss_fn(
-                    net=self.net,
-                    images=target,
-                    condition=condition,
-                    augment_pipe=self.augment_pipe,
-                    **loss_kwargs,
-                )
+                sampled_sigma = None
+                if self.track_sigma_bin_loss:
+                    loss_out = self.loss_fn(
+                        net=self.net,
+                        images=target,
+                        condition=condition,
+                        augment_pipe=self.augment_pipe,
+                        return_sigma=True,
+                        **loss_kwargs,
+                    )
+                    loss, sampled_sigma = loss_out
+                else:
+                    loss = self.loss_fn(
+                        net=self.net,
+                        images=target,
+                        condition=condition,
+                        augment_pipe=self.augment_pipe,
+                        **loss_kwargs,
+                    )
 
                 if mask is not None:
                     loss = loss * mask
+
+                if self.track_sigma_bin_loss and sampled_sigma is not None:
+                    sample_loss = loss.detach().mean(dim=(1, 2, 3))
+                    sample_sigma = sampled_sigma.detach().reshape(-1).to(torch.float32)
+                    bin_idx = torch.bucketize(sample_sigma, self.sigma_bin_edges) - 1
+                    n_bins = int(self.sigma_bin_edges.numel() - 1)
+                    valid = (bin_idx >= 0) & (bin_idx < n_bins)
+                    if torch.any(valid):
+                        idx = bin_idx[valid]
+                        vals = sample_loss[valid]
+                        sigma_bin_loss_sum.index_add_(0, idx, vals)
+                        sigma_bin_count.index_add_(
+                            0, idx, torch.ones_like(vals, dtype=torch.float32)
+                        )
 
             channelwise_loss_step = loss.detach().mean(dim=(0, 2, 3))
             if self.use_shard_tensor:
@@ -669,6 +737,25 @@ class Trainer:
             self.logger.log_value(
                 f"loss/train/{ch}", value / self.num_accumulation_rounds
             )
+        if self.track_sigma_bin_loss:
+            if self.dist.world_size > 1:
+                torch.distributed.all_reduce(
+                    sigma_bin_loss_sum, op=torch.distributed.ReduceOp.SUM
+                )
+                torch.distributed.all_reduce(
+                    sigma_bin_count, op=torch.distributed.ReduceOp.SUM
+                )
+            edges = self.sigma_bin_edges.detach().cpu().tolist()
+            for b in range(int(self.sigma_bin_edges.numel() - 1)):
+                count = float(sigma_bin_count[b].item())
+                if count <= 0:
+                    continue
+                mean_val = float((sigma_bin_loss_sum[b] / sigma_bin_count[b]).item())
+                left = edges[b]
+                right = edges[b + 1]
+                self.logger.log_value(
+                    f"loss/train_sigma_bin/[{left:.3e},{right:.3e})", mean_val
+                )
 
         # Gradient clipping
         if self.cfg.training.clip_grad_norm > 0:

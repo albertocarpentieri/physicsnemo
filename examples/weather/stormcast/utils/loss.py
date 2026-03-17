@@ -103,6 +103,7 @@ class EDMLoss:
         labels: torch.Tensor | None = None,
         augment_pipe: Callable | None = None,
         lead_time_label: torch.Tensor | None = None,
+        return_sigma: bool = False,
     ) -> torch.Tensor:
         """
         Calculate and return the loss corresponding to the EDM formulation.
@@ -167,6 +168,8 @@ class EDMLoss:
         else:
             D_yn = net(y + n, sigma.flatten(), labels, **optional_args)
         loss = weight * ((D_yn - y) ** 2)
+        if return_sigma:
+            return (loss, sigma)
         return loss
 
 
