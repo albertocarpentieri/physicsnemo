@@ -306,44 +306,6 @@ def regression_model_forward(
     return model(x, **labels)
 
 
-def regression_loss_fn(
-    net: Module,
-    images: torch.Tensor,
-    condition: torch.Tensor,
-    class_labels: None = None,
-    lead_time_label: torch.Tensor | None = None,
-    augment_pipe: Callable | None = None,
-    return_model_outputs: bool = False,
-) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-    """Helper function for training the StormCast regression model, so that it has a similar call signature as
-    the EDMLoss and the same training loop can be used to train both regression and diffusion models
-
-    Args:
-        net: physicsnemo.models.diffusion.StormCastUNet
-        images: Target data, shape [batch_size, target_channels, w, h]
-        condition: input to the model, shape=[batch_size, condition_channel, w, h]
-        class_labels: unused (applied to match EDMLoss signature)
-        lead_time_label: lead time label or None if lead time embedding is not used
-        augment_pipe: optional data augmentation pipe
-        return_model_outputs: If True, will return the generated outputs
-    Returns:
-        out: loss function with shape [batch_size, target_channels, w, h]
-            This should be averaged to get the mean loss for gradient descent.
-    """
-
-    y, augment_labels = (
-        augment_pipe(images) if augment_pipe is not None else (images, None)
-    )
-
-    labels = {} if lead_time_label is None else {"lead_time_label": lead_time_label}
-    D_yn = net(x=condition, **labels)
-    loss = (D_yn - y) ** 2
-    if return_model_outputs:
-        return loss, D_yn
-    else:
-        return loss
-
-
 def nested_to(
     x: torch.Tensor | Mapping | list | tuple | Any, **kwargs
 ) -> torch.Tensor | dict | list | Any:

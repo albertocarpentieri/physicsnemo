@@ -173,6 +173,43 @@ class EDMLoss:
         return loss
 
 
+def regression_loss_fn(
+    net,
+    images: torch.Tensor,
+    condition: torch.Tensor,
+    class_labels=None,
+    lead_time_label: torch.Tensor | None = None,
+    augment_pipe=None,
+    return_model_outputs: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """MSE loss for the StormCast regression model.
+
+    Shares call signature with EDMLoss so the same training loop works for both.
+
+    Args:
+        net: regression network (e.g. StormCastUNet).
+        images: target data, shape ``[B, C, H, W]``.
+        condition: model input, shape ``[B, C_cond, H, W]``.
+        class_labels: unused (present for EDMLoss call-signature parity).
+        lead_time_label: optional lead-time label, shape ``(B,)``.
+        augment_pipe: optional data augmentation callable.
+        return_model_outputs: if True, return ``(loss, prediction)``.
+
+    Returns:
+        Per-pixel squared error ``[B, C, H, W]``, or ``(loss, prediction)``
+        when *return_model_outputs* is True.
+    """
+    y, augment_labels = (
+        augment_pipe(images) if augment_pipe is not None else (images, None)
+    )
+    labels = {} if lead_time_label is None else {"lead_time_label": lead_time_label}
+    D_yn = net(x=condition, **labels)
+    loss = (D_yn - y) ** 2
+    if return_model_outputs:
+        return loss, D_yn
+    return loss
+
+
 class EDMLossLogUniform(EDMLoss):
     """
     EDM Loss with log-uniform sampling for `sigma`.
