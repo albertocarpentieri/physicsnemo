@@ -637,12 +637,6 @@ class Trainer:
                 f"loss/train_sigma_bin/[{left:.3e},{right:.3e})", mean_val
             )
 
-    def _resume_or_init(
-        self,
-        net: Module,
-        optimizer: torch.optim.Optimizer,
-        scheduler: torch.optim.lr_scheduler.LRScheduler | None,
-    ) -> tuple[int, float]:
     def _resume_or_init(self) -> tuple[int, float]:
         r"""
         Resume from checkpoint or initialize training.
