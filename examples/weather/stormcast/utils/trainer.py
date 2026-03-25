@@ -390,6 +390,18 @@ class Trainer:
 
         # Build network
         model_cfg = self.cfg.model
+        model_hparams = dict(model_cfg.hyperparameters)
+        # Ensure the preconditioner uses the same sigma_data as the loss.
+        # Without this, EDMPrecond defaults to sigma_data=0.5 regardless of
+        # the value set in training.loss.sigma_data, causing a mismatch
+        # between the loss weighting and the preconditioning coefficients.
+        if self.loss_type == "edm":
+            loss_sigma_data = self.cfg.training.loss.sigma_data
+            model_hparams.setdefault("sigma_data", loss_sigma_data)
+            self.logger.info(
+                f"Preconditioner sigma_data: {model_hparams['sigma_data']} "
+                f"(loss sigma_data: {loss_sigma_data})"
+            )
         if model_cfg.architecture == "unet":
             net = get_preconditioned_unet(
                 name=self.net_name,
@@ -399,7 +411,7 @@ class Trainer:
                 lead_time_steps=self.lead_time_steps,
                 amp_mode=self.enable_amp,
                 use_apex_gn=self.use_apex_gn,
-                **model_cfg.hyperparameters,
+                **model_hparams,
             )
         elif model_cfg.architecture == "dit":
             net = get_preconditioned_natten_dit(
@@ -408,7 +420,7 @@ class Trainer:
                 conditional_channels=num_condition_channels,
                 scalar_condition_channels=len(self.scalar_cond_channels),
                 lead_time_steps=self.lead_time_steps,
-                **model_cfg.hyperparameters,
+                **model_hparams,
             )
         else:
             raise ValueError("model.architecture must be 'unet' or 'dit'")
