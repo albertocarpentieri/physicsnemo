@@ -48,16 +48,19 @@ def _load_config(config_name: str) -> DictConfig:
 
 @pytest.fixture
 def cfg_regression():
+    """Load the test regression U-Net config."""
     return _load_config(config_name="test_regression_unet.yaml")
 
 
 @pytest.fixture
 def cfg_diffusion():
+    """Load the test diffusion DiT config."""
     return _load_config(config_name="test_diffusion.yaml")
 
 
 @pytest.fixture
 def cfg_diffusion_unet():
+    """Load the test diffusion U-Net config."""
     return _load_config(config_name="test_diffusion_unet.yaml")
 
 
@@ -456,6 +459,56 @@ def test_seeding(
     _check_sigma_pattern("after training/validation/checkpoint")
 
     torch.distributed.barrier()
+
+
+@pytest.mark.parametrize(
+    "sigma_data",
+    [0.3, 1.0, [0.2, 0.5, 0.8]],
+    ids=["scalar_0.3", "scalar_1.0", "per_channel"],
+)
+def test_sigma_data_preconditioner(
+    tmp_path: Path,
+    cfg_diffusion_unet: DictConfig,
+    *,
+    sigma_data,
+):
+    """Verify that training.loss.sigma_data is forwarded to the EDM preconditioner."""
+    dist = DistributedManager()
+    if dist.world_size > 1:
+        pytest.skip("Skipping: single-process test.")
+
+    rundir = _setup_rundir(tmp_path, dist.world_size)
+    cfg = cfg_diffusion_unet.copy()
+    cfg.training.rundir = rundir
+    cfg.training.total_train_steps = 1
+    cfg.training.loss.sigma_data = sigma_data
+
+    if isinstance(sigma_data, list):
+        cfg.dataset.num_state_channels = len(sigma_data)
+
+    t = trainer.Trainer(cfg)
+
+    # The preconditioner's sigma_data buffer should match the loss config.
+    net = t.net
+    # Unwrap FSDP if needed.
+    raw_net = net.module if hasattr(net, "module") else net
+    precond_sd = raw_net.sigma_data
+
+    if isinstance(sigma_data, (list, tuple)):
+        expected = torch.as_tensor(sigma_data, dtype=torch.float32).reshape(1, -1, 1, 1)
+        assert precond_sd.shape == expected.shape, (
+            f"Per-channel sigma_data shape mismatch: {precond_sd.shape} vs {expected.shape}"
+        )
+        assert torch.allclose(precond_sd.cpu().float(), expected), (
+            f"Per-channel sigma_data value mismatch: {precond_sd} vs {expected}"
+        )
+    else:
+        expected_val = float(sigma_data)
+        actual_val = float(precond_sd)
+        assert abs(actual_val - expected_val) < 1e-6, (
+            f"Scalar sigma_data mismatch: preconditioner has {actual_val}, "
+            f"expected {expected_val}"
+        )
 
 
 @pytest.mark.parametrize("net_architecture", ["unet", "dit"])

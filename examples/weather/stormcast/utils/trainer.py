@@ -397,11 +397,22 @@ class Trainer:
         # between the loss weighting and the preconditioning coefficients.
         if self.loss_type == "edm":
             loss_sigma_data = self.cfg.training.loss.sigma_data
+            precond_sd_override = model_hparams.get("sigma_data")
+            if isinstance(loss_sigma_data, (list, tuple)):
+                loss_sigma_data = torch.as_tensor(
+                    list(loss_sigma_data), dtype=torch.float32
+                )[None, :, None, None]
             model_hparams.setdefault("sigma_data", loss_sigma_data)
-            self.logger.info(
-                f"Preconditioner sigma_data: {model_hparams['sigma_data']} "
-                f"(loss sigma_data: {loss_sigma_data})"
-            )
+            if (
+                precond_sd_override is not None
+                and precond_sd_override != loss_sigma_data
+            ):
+                self.logger.info(
+                    f"sigma_data override: preconditioner uses {precond_sd_override} "
+                    f"(from model.hyperparameters), loss uses {loss_sigma_data}"
+                )
+            else:
+                self.logger.info(f"sigma_data: {model_hparams['sigma_data']}")
         if model_cfg.architecture == "unet":
             net = get_preconditioned_unet(
                 name=self.net_name,
