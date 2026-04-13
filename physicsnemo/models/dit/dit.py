@@ -396,9 +396,7 @@ class DiT(Module):
             if not old_key.startswith(legacy_prefix):
                 continue
             new_key = new_prefix + old_key[len(legacy_prefix) :]
-            if old_key == legacy_prefix + "freqs":
-                del state_dict[old_key]
-            elif new_key not in state_dict:
+            if new_key not in state_dict:
                 state_dict[new_key] = state_dict.pop(old_key)
 
     def initialize_weights(self):

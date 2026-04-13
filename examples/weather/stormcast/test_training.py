@@ -165,8 +165,9 @@ def test_training(
     if dist.world_size > 1:
         torch.distributed.barrier()
 
-    net_cls = "EDMPrecond" if net_architecture == "unet" else "EDMPreconditioner"
-    ckpt_path = os.path.join(rundir, "checkpoints_diffusion", f"{net_cls}.0.10.mdlus")
+    ckpt_path = os.path.join(
+        rundir, "checkpoints_diffusion", "EDMPreconditioner.0.10.mdlus"
+    )
     assert os.path.isfile(ckpt_path), "Diffusion checkpoint not found"
 
 
@@ -235,8 +236,9 @@ def test_checkpointing(
     if num_procs > 1:
         torch.distributed.barrier()
 
-    net_cls = "EDMPrecond" if net_architecture == "unet" else "EDMPreconditioner"
-    ckpt_path = os.path.join(rundir, "checkpoints_diffusion", f"{net_cls}.0.20.mdlus")
+    ckpt_path = os.path.join(
+        rundir, "checkpoints_diffusion", "EDMPreconditioner.0.20.mdlus"
+    )
     assert os.path.isfile(ckpt_path), (
         f"Diffusion checkpoint not found on rank {dist.rank}"
     )
@@ -362,7 +364,7 @@ def test_seeding(
 
       - Domain (model-parallel) groups are {0, 1} and {2, 3}.
         Ranks within the same domain group must see **identical** sigma
-        (enforced by ``replicate_in_mesh`` broadcast).
+        (enforced by ``DomainParallelNoiseScheduler`` broadcast).
       - DDP (data-parallel) groups are {0, 2} and {1, 3}.
         Ranks in different DDP groups must see **different** sigma
         (they process different data and have distinct RNG seeds).
@@ -394,17 +396,26 @@ def test_seeding(
 
     t = trainer.Trainer(cfg)
 
-    # -- instrument the loss to capture post-broadcast sigma values ----------
-    captured_sigmas: list[torch.Tensor] = []
-    _orig_replicate = t.loss_fn.replicate_in_mesh
+    # -- instrument the loss to capture sigma values -------------------------
+    from physicsnemo.diffusion.noise_schedulers import DomainParallelNoiseScheduler
 
-    def _capturing_replicate(x, y):
-        result = _orig_replicate(x, y)
-        local = result.to_local() if hasattr(result, "to_local") else result
-        captured_sigmas.append(local.detach().cpu())
+    scheduler = t.train_noise_scheduler
+    if domain_parallel_size > 1 and not isinstance(
+        scheduler, DomainParallelNoiseScheduler
+    ):
+        raise ValueError(
+            "test_seeding requires a DomainParallelNoiseScheduler on the "
+            "loss when domain_parallel_size > 1"
+        )
+    captured_sigmas: list[torch.Tensor] = []
+    _orig_sample_time = scheduler.sample_time
+
+    def _capturing_sample_time(*args, **kwargs):
+        result = _orig_sample_time(*args, **kwargs)
+        captured_sigmas.append(result.detach().cpu())
         return result
 
-    t.loss_fn.replicate_in_mesh = _capturing_replicate
+    scheduler.sample_time = _capturing_sample_time
 
     # -- helper: gather sigmas and assert the expected pattern ---------------
     def _check_sigma_pattern(label: str) -> None:
@@ -573,8 +584,7 @@ def test_model_types(
         if dist.world_size > 1:
             torch.distributed.barrier()
 
-        net_cls = "EDMPrecond" if net_architecture == "unet" else "EDMPreconditioner"
         ckpt_path = os.path.join(
-            rundir, "checkpoints_diffusion", f"{net_cls}.0.10.mdlus"
+            rundir, "checkpoints_diffusion", "EDMPreconditioner.0.10.mdlus"
         )
         assert os.path.isfile(ckpt_path), "Diffusion checkpoint not found"
