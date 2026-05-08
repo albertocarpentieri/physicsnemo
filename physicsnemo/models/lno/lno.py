@@ -1,38 +1,40 @@
 import math
+from dataclasses import dataclass
+from functools import partial
+
 import torch
-import torch.nn as nn
-import torch.special as special
 import torch.amp as amp
+import torch.nn as nn
+import torch_harmonics as th
 from torch.utils.checkpoint import checkpoint
 
-from functools import partial
-from itertools import groupby
+# Self-contained model building blocks (no Makani dependency).
+from ._layers import (
+    DropPath,
+    EncoderDecoder,
+    LayerScale,
+    MLP,
+    SpectralConv,
+)
 
-# helpers
-from makani.models.common import DropPath, LayerScale, MLP, EncoderDecoder, SpectralConv
-from makani.utils.features import get_water_channels, get_channel_groups
-
-# get spectral transforms and spherical convolutions from torch_harmonics
-import torch_harmonics as th
-import torch_harmonics.distributed as thd
-
-# get pre-formulated layers
-#from makani.models.common import GeometricInstanceNormS2
-from makani.mpu.layers import DistributedMLP, DistributedEncoderDecoder
-
-# more distributed stuff
-from makani.utils import comm
-
-# layer normalization
-from physicsnemo.distributed.mappings import scatter_to_parallel_region, gather_from_parallel_region
-from physicsnemo.core import ModelMetaData
-from physicsnemo.core import Module
-from dataclasses import dataclass
+from physicsnemo.core import ModelMetaData, Module
 
 # heuristic for finding theta_cutoff
 def _compute_cutoff_radius(nlat, kernel_shape, basis_type):
-    theta_cutoff_factor = {"piecewise linear": 0.5, "morlet": 0.5, "zernike": math.sqrt(2.0)}
-
+    # `harmonic` is the modern (L2-normalized) torch-harmonics replacement for
+    # the deprecated `morlet`; both share the same cutoff scaling.
+    theta_cutoff_factor = {
+        "piecewise linear": 0.5,
+        "morlet": 0.5,
+        "harmonic": 0.5,
+        "zernike": math.sqrt(2.0),
+        "fourier-bessel": 0.5,
+    }
+    if basis_type not in theta_cutoff_factor:
+        raise ValueError(
+            f"Unknown basis_type='{basis_type}'. "
+            f"Supported: {sorted(theta_cutoff_factor.keys())}"
+        )
     return (kernel_shape[0] + 1) * theta_cutoff_factor[basis_type] * math.pi / float(nlat - 1)
 
 # commenting out torch.compile due to long intiial compile times
@@ -68,9 +70,7 @@ class DiscreteContinuousEncoder(nn.Module):
         # heuristic for finding theta_cutoff
         theta_cutoff = _compute_cutoff_radius(nlat=inp_shape[0], kernel_shape=kernel_shape, basis_type=basis_type) * theta_cutoff_factor
 
-        # set up local convolution
-        conv_handle = thd.DistributedDiscreteContinuousConvS2 if comm.get_size("spatial") > 1 else th.DiscreteContinuousConvS2
-        self.conv = conv_handle(
+        self.conv = th.DiscreteContinuousConvS2(
             inp_chans,
             out_chans,
             in_shape=inp_shape,
@@ -84,12 +84,6 @@ class DiscreteContinuousEncoder(nn.Module):
             bias=bias,
             theta_cutoff=theta_cutoff,
         )
-        if comm.get_size("spatial") > 1:
-            self.conv.weight.is_shared_mp = ["spatial"]
-            self.conv.weight.sharded_dims_mp = [None, None, None]
-            if self.conv.bias is not None:
-                self.conv.bias.is_shared_mp = ["spatial"]
-                self.conv.bias.sharded_dims_mp = [None]
 
         if use_mlp:
             with torch.no_grad():
@@ -153,42 +147,27 @@ class DiscreteContinuousDecoder(nn.Module):
 
             self.act = activation_function()
 
-        # init distributed torch-harmonics if needed
-        if comm.get_size("spatial") > 1:
-            polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
-            azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
-            thd.init(polar_group, azimuth_group)
-
-        # spatial parallelism in the SHT
         self.linear = None
         if upsample_sht:
-            # set up sht for upsampling
-            sht_handle = thd.DistributedRealSHT if comm.get_size("spatial") > 1 else th.RealSHT
-            isht_handle = thd.DistributedInverseRealSHT if comm.get_size("spatial") > 1 else th.InverseRealSHT
-
-            # set upsampling module
-            self.sht = sht_handle(*inp_shape, grid=grid_in).float()
-            self.isht = isht_handle(*out_shape, lmax=self.sht.lmax, mmax=self.sht.mmax, grid=grid_out).float()
+            self.sht = th.RealSHT(*inp_shape, grid=grid_in).float()
+            self.isht = th.InverseRealSHT(
+                *out_shape, lmax=self.sht.lmax, mmax=self.sht.mmax, grid=grid_out,
+            ).float()
             self.upsample = nn.Sequential(self.sht, self.isht)
         elif upsample_shuffle:
             scale_factor = out_shape[0] // inp_shape[0]
-            resample_handle = thd.DistributedResampleS2 if comm.get_size("spatial") > 1 else th.ResampleS2
             self.upsample = nn.Sequential(
-                nn.Conv2d(inp_chans, inp_chans // (scale_factor**2), kernel_size=1, bias=False), 
-                resample_handle(*inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out, mode="bilinear")
+                nn.Conv2d(inp_chans, inp_chans // (scale_factor ** 2), kernel_size=1, bias=False),
+                th.ResampleS2(*inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out, mode="bilinear"),
             )
-            inp_chans = inp_chans // (scale_factor**2)
+            inp_chans = inp_chans // (scale_factor ** 2)
         else:
-            resample_handle = thd.DistributedResampleS2 if comm.get_size("spatial") > 1 else th.ResampleS2
-            self.upsample = resample_handle(*inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out, mode="bilinear")
+            self.upsample = th.ResampleS2(*inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out, mode="bilinear")
 
-        # heuristic for finding theta_cutoff
-        # nto entirely clear if out or in shape should be used here with a non-conv method for upsampling
+        # Heuristic for theta_cutoff (use out shape).
         theta_cutoff = _compute_cutoff_radius(nlat=out_shape[0], kernel_shape=kernel_shape, basis_type=basis_type) * theta_cutoff_factor
 
-        # set up DISCO convolution
-        conv_handle = thd.DistributedDiscreteContinuousConvS2 if comm.get_size("spatial") > 1 else th.DiscreteContinuousConvS2
-        self.conv = conv_handle(
+        self.conv = th.DiscreteContinuousConvS2(
             inp_chans,
             out_chans,
             in_shape=out_shape,
@@ -202,12 +181,6 @@ class DiscreteContinuousDecoder(nn.Module):
             bias=False,
             theta_cutoff=theta_cutoff,
         )
-        if comm.get_size("spatial") > 1:
-            self.conv.weight.is_shared_mp = ["spatial"]
-            self.conv.weight.sharded_dims_mp = [None, None, None]
-            if self.conv.bias is not None:
-                self.conv.bias.is_shared_mp = ["spatial"]
-                self.conv.bias.sharded_dims_mp = [None]
 
     def forward(self, x):
         dtype = x.dtype
@@ -266,8 +239,7 @@ class NeuralOperatorBlock(nn.Module):
             # heuristic for finding theta_cutoff
             theta_cutoff = _compute_cutoff_radius(nlat=self.inp_shape[0], kernel_shape=kernel_shape, basis_type=basis_type) * theta_cutoff_factor
 
-            conv_handle = thd.DistributedDiscreteContinuousConvS2 if comm.get_size("spatial") > 1 else th.DiscreteContinuousConvS2
-            self.local_conv = conv_handle(
+            self.local_conv = th.DiscreteContinuousConvS2(
                 inp_chans,
                 inp_chans,
                 in_shape=self.inp_shape,
@@ -281,12 +253,6 @@ class NeuralOperatorBlock(nn.Module):
                 bias=False,
                 theta_cutoff=theta_cutoff,
             )
-            if comm.get_size("spatial") > 1:
-                self.local_conv.weight.is_shared_mp = ["spatial"]
-                self.local_conv.weight.sharded_dims_mp = [None, None, None]
-                if self.local_conv.bias is not None:
-                    self.local_conv.bias.is_shared_mp = ["spatial"]
-                    self.local_conv.bias.sharded_dims_mp = [None]
 
             with torch.no_grad():
                 self.local_conv.weight *= gain_factor
@@ -309,10 +275,9 @@ class NeuralOperatorBlock(nn.Module):
         # norm layer
         self.norm = norm_layer()
 
-        if use_mlp == True:
-            MLPH = DistributedMLP if (comm.get_size("matmul") > 1) else MLP
+        if use_mlp:
             mlp_hidden_dim = int(inp_chans * mlp_ratio)
-            self.mlp = MLPH(
+            self.mlp = MLP(
                 in_features=inp_chans,
                 out_features=out_chans,
                 hidden_features=mlp_hidden_dim,
@@ -328,8 +293,6 @@ class NeuralOperatorBlock(nn.Module):
 
         if layer_scale:
             self.layer_scale = LayerScale(out_chans)
-            self.layer_scale.weight.is_shared_mp = ["spatial"]
-            self.layer_scale.weight.sharded_dims_mp = [None, None, None, None]
         else:
             self.layer_scale = nn.Identity()
 
@@ -338,11 +301,6 @@ class NeuralOperatorBlock(nn.Module):
             gain_factor = 1.0
             self.skip = nn.Conv2d(inp_chans, out_chans, 1, 1, bias=False)
             torch.nn.init.normal_(self.skip.weight, std=math.sqrt(gain_factor / inp_chans))
-            self.skip.weight.is_shared_mp = ["spatial"]
-            self.skip.weight.sharded_dims_mp = [None, None, None, None]
-            if self.skip.bias is not None:
-                self.skip.bias.is_shared_mp = ["spatial"]
-                self.skip.bias.sharded_dims_mp = [None]
         elif skip == "identity":
             self.skip = nn.Identity()
         elif skip == "none":
@@ -529,9 +487,6 @@ class PrecipNeuralOperatorNet(Module):
                     self.noise_mergers = nn.ModuleList([])
                     for _ in range(num_layers):
                         self.noise_mergers.append(nn.Conv2d(self.embed_dim + self.noise_embed_dim, self.embed_dim, kernel_size=1, bias=False))
-                        if hasattr(self.noise_mergers[-1], "weight") and hasattr(self.noise_mergers[-1].weight, "is_shared_mp"):
-                            self.noise_mergers[-1].weight.is_shared_mp = ["spatial"]
-                            self.noise_mergers[-1].weight.sharded_dims_mp = [None, None, None, None]
         else:
             self.encoder = nn.Identity()
 
@@ -582,6 +537,14 @@ class PrecipNeuralOperatorNet(Module):
                 else:
                     out_ch = self.embed_dim
 
+                # Skip "identity" assumes in_ch == out_ch; when they differ (e.g. the
+                # encoder-less / decoder-less degenerate config that maps in_channels
+                # directly to out_channels in a single block), the original forward
+                # would reuse `x[:, :out_chans]` as a residual, silently injecting the
+                # first few input channels as an additive bias. Disable the skip in
+                # that case so the block produces a clean prediction.
+                block_skip = "identity" if in_ch == out_ch else "none"
+
                 block = NeuralOperatorBlock(
                     self.sht,
                     self.isht,
@@ -593,7 +556,7 @@ class PrecipNeuralOperatorNet(Module):
                     path_drop_rate=dpr[i],
                     act_layer=activation_function,
                     norm_layer=norm_layer,
-                    skip="identity",
+                    skip=block_skip,
                     layer_scale=layer_scale,
                     use_mlp=use_mlp,
                     kernel_shape=kernel_shape,
@@ -609,11 +572,6 @@ class PrecipNeuralOperatorNet(Module):
         # residual prediction
         if self.big_skip:
             self.residual_transform = nn.Conv2d(self.in_channels, self.out_channels, 1, bias=False)
-            self.residual_transform.weight.is_shared_mp = ["spatial"]
-            self.residual_transform.weight.sharded_dims_mp = [None, None, None, None]
-            if self.residual_transform.bias is not None:
-                self.residual_transform.bias.is_shared_mp = ["spatial"]
-                self.residual_transform.bias.sharded_dims_mp = [None]
             scale = math.sqrt(0.5 / max(1, self.in_channels))
             nn.init.normal_(self.residual_transform.weight, mean=0.0, std=scale)
 
@@ -638,20 +596,8 @@ class PrecipNeuralOperatorNet(Module):
             modes_lat = int(self.h * hard_thresholding_fraction)
             modes_lon = int((self.w // 2 + 1) * hard_thresholding_fraction)
 
-        sht_handle = th.RealSHT
-        isht_handle = th.InverseRealSHT
-
-        # spatial parallelism in the SHT
-        if comm.get_size("spatial") > 1:
-            polar_group = None if (comm.get_size("h") == 1) else comm.get_group("h")
-            azimuth_group = None if (comm.get_size("w") == 1) else comm.get_group("w")
-            thd.init(polar_group, azimuth_group)
-            sht_handle = thd.DistributedRealSHT
-            isht_handle = thd.DistributedInverseRealSHT
-
-        # set up
-        self.sht = sht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
-        self.isht = isht_handle(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
+        self.sht = th.RealSHT(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
+        self.isht = th.InverseRealSHT(self.h, self.w, lmax=modes_lat, mmax=modes_lon, grid=sht_grid_type).float()
 
     @torch.compiler.disable(recursive=True)
     def _get_norm_layer_handle(
@@ -665,25 +611,36 @@ class PrecipNeuralOperatorNet(Module):
         """
         get the handle for ionitializing normalization layers
         """
-        # pick norm layer
+        # Pick norm layer. The Makani-only options are imported lazily so the
+        # LNO model can be used without Makani installed.
         if normalization_layer == "layer_norm":
-            from makani.mpu.layer_norm import DistributedLayerNorm
-            norm_layer_handle = partial(DistributedLayerNorm, normalized_shape=(embed_dim), elementwise_affine=True, eps=1e-6)
-        elif normalization_layer == "instance_norm":
-            if comm.get_size("spatial") > 1:
-                from makani.mpu.layer_norm import DistributedInstanceNorm2d
-                norm_layer_handle = partial(DistributedInstanceNorm2d, num_features=embed_dim, eps=1e-6, affine=True)
-            else:
-                norm_layer_handle = partial(nn.InstanceNorm2d, num_features=embed_dim, eps=1e-6, affine=True, track_running_stats=False)
-        elif normalization_layer == "instance_norm_s2":
-            if comm.get_size("spatial") > 1:
-                from makani.mpu.layer_norm import DistributedGeometricInstanceNormS2
-                norm_layer_handle = DistributedGeometricInstanceNormS2
-            else:
-                from makani.models.common import GeometricInstanceNormS2
-                norm_layer_handle = GeometricInstanceNormS2
+            try:
+                from makani.mpu.layer_norm import DistributedLayerNorm  # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    "normalization_layer='layer_norm' requires the `makani` package."
+                ) from exc
             norm_layer_handle = partial(
-                norm_layer_handle,
+                DistributedLayerNorm,
+                normalized_shape=(embed_dim,),
+                elementwise_affine=True,
+                eps=1e-6,
+            )
+        elif normalization_layer == "instance_norm":
+            norm_layer_handle = partial(
+                nn.InstanceNorm2d,
+                num_features=embed_dim, eps=1e-6, affine=True,
+                track_running_stats=False,
+            )
+        elif normalization_layer == "instance_norm_s2":
+            try:
+                from makani.models.common import GeometricInstanceNormS2 as _NormCls  # type: ignore
+            except ImportError as exc:
+                raise ImportError(
+                    "normalization_layer='instance_norm_s2' requires the `makani` package."
+                ) from exc
+            norm_layer_handle = partial(
+                _NormCls,
                 img_shape=(h, w),
                 crop_shape=(h, w),
                 crop_offset=(0, 0),
@@ -696,7 +653,7 @@ class PrecipNeuralOperatorNet(Module):
         elif normalization_layer == "none":
             norm_layer_handle = nn.Identity
         else:
-            raise NotImplementedError(f"Error, normalization {normalization_layer} not implemented.")
+            raise NotImplementedError(f"normalization_layer='{normalization_layer}' not implemented.")
 
         return norm_layer_handle
 

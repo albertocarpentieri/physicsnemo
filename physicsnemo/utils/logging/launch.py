@@ -481,17 +481,8 @@ class LaunchLogger(object):
 
         if use_mlflow:
             LaunchLogger.toggle_mlflow(True)
-        
-                # TensorBoard initialize
-        if use_tensorboard:
-            if SummaryWriter is None:
-                PythonLogger().warning("TensorBoard not available (install tensorboard). Turning off TB logging")
-            else:
-                LaunchLogger.toggle_tensorboard(True)
-                log_dir = tensorboard_log_dir or "./runs"
-                try:
-                    LaunchLogger.tb_writer = SummaryWriter(log_dir=log_dir)
-                    PythonLogger().info(f"TensorBoard writer initialized at {log_dir}")
-                except Exception as e:
-                    PythonLogger().warning(f"Failed to initialize TensorBoard writer: {e}")
-                    LaunchLogger.toggle_tensorboard(False)
+
+        # NOTE: TensorBoard is enabled by calling
+        # ``physicsnemo.utils.logging.tensorboard.initialize_tensorboard(...)``,
+        # which sets ``LaunchLogger.tb_writer`` and toggles the backend on its
+        # own. Don't pass tensorboard kwargs to ``initialize`` here.
