@@ -15,3 +15,5 @@
 # limitations under the License.
 
 from .lno import PrecipNeuralOperatorNet
+from .attention_net import PrecipAttentionNet, SphericalTransformerBlock
+from .temporal_interpolation_net import TemporalInterpolationNet
