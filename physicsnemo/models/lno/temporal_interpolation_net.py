@@ -69,7 +69,10 @@ from torch_harmonics.quadrature import precompute_latitudes
 
 from physicsnemo.core import ModelMetaData, Module
 
-from .attention_net import AttentionDecoder, AttentionEncoder, SphericalTransformerBlock
+from .attention_net import (
+    AttentionDecoder, AttentionEncoder, SphericalTransformerBlock,
+    _SpectralPositionEmbedding,
+)
 from ._layers import DropPath
 
 
@@ -80,10 +83,17 @@ from ._layers import DropPath
 class TemporalQueryMap(nn.Module):
     """Maps a scalar τ ∈ (0, 1) to a spatial feature map ``(B, D, h, w)``.
 
-    A bank of sinusoidal Fourier features of τ is projected by a 2-layer MLP
-    to ``embed_dim`` values, which are broadcast spatially and added to a
-    learnable spatial bias.  This gives every spatial token a time-conditional
-    query embedding that is also aware of its position on the sphere.
+    The output is the sum of two components:
+
+    * **Temporal part** — sinusoidal Fourier features of τ projected by a
+      2-layer MLP to ``(B, D)``, then broadcast to every spatial position.
+      This encodes *when* we want to interpolate.
+
+    * **Spatial part** — a fixed ``_SpectralPositionEmbedding`` (spherical
+      harmonic basis functions) shared across all τ.  This grounds every
+      query token at a physically meaningful location on the sphere, giving
+      the cross-attention the same spatial awareness as the processor blocks
+      — without introducing any free per-location parameters.
 
     Parameters
     ----------
@@ -91,12 +101,22 @@ class TemporalQueryMap(nn.Module):
         Feature dimension ``D`` of the output map.
     h, w:
         Spatial dimensions of the bottleneck grid.
+    grid:
+        torch-harmonics grid type for the spherical positional embedding
+        (e.g. ``"legendre-gauss"``).
     n_fourier:
         Number of sinusoidal feature pairs (total feature size = ``n_fourier``).
         Must be even.
     """
 
-    def __init__(self, embed_dim: int, h: int, w: int, n_fourier: int = 32):
+    def __init__(
+        self,
+        embed_dim: int,
+        h: int,
+        w: int,
+        grid: str = "legendre-gauss",
+        n_fourier: int = 32,
+    ):
         super().__init__()
         assert n_fourier % 2 == 0, "n_fourier must be even"
         half = n_fourier // 2
@@ -109,9 +129,10 @@ class TemporalQueryMap(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dim, embed_dim, bias=True),
         )
-        # Learnable per-location additive spatial bias
-        self.spatial_bias = nn.Parameter(torch.zeros(1, embed_dim, h, w))
-        nn.init.trunc_normal_(self.spatial_bias, std=0.02)
+        # Fixed spherical-harmonic positional embedding — same as used by the
+        # processor blocks.  Channel i is the i-th real SH basis function on
+        # the (h, w) grid, normalised to unit max amplitude.
+        self.spatial_embed = _SpectralPositionEmbedding((h, w), embed_dim, grid)
 
     def forward(self, tau: torch.Tensor) -> torch.Tensor:
         """
@@ -123,12 +144,15 @@ class TemporalQueryMap(nn.Module):
         -------
         ``(B, D, h, w)``
         """
-        # Fourier embedding: (B, n_fourier)
         angles = tau.unsqueeze(-1) * self.freqs.unsqueeze(0) * (2.0 * math.pi)
         feat = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        # MLP → (B, D) → (B, D, 1, 1) → broadcast
-        d_vec = self.mlp(feat).unsqueeze(-1).unsqueeze(-1)  # (B, D, 1, 1)
-        return d_vec + self.spatial_bias                      # (B, D, h, w)
+        d_vec = self.mlp(feat).unsqueeze(-1).unsqueeze(-1)       # (B, D, 1, 1)
+        B = tau.shape[0]
+        _, D, h, w = self.spatial_embed.position_embeddings.shape
+        # Broadcast temporal vector over the spatial grid, then add the fixed
+        # spherical-harmonic positional embedding in-place via spatial_embed.
+        spatial_map = d_vec.expand(B, D, h, w)                   # (B, D, h, w)
+        return self.spatial_embed(spatial_map)                    # (B, D, h, w)
 
 
 # ---------------------------------------------------------------------------
@@ -219,9 +243,6 @@ class SphericalTemporalCrossAttentionBlock(nn.Module):
             if proj.bias is not None:
                 nn.init.zeros_(proj.bias)
 
-        self.norm_q = nn.GroupNorm(1, embed_dim, eps=1e-6)
-        self.norm_out = nn.GroupNorm(1, embed_dim, eps=1e-6)
-
         # ---- Spherical quadrature weights, duplicated for 2 frames ----
         # precompute_latitudes returns (colatitudes, weights) where weights
         # integrate over the colatitude axis.  Multiplying by 2π/W gives the
@@ -260,11 +281,8 @@ class SphericalTemporalCrossAttentionBlock(nn.Module):
         ctx0 = context[:, :D]   # (B, D, h, w)
         ctx1 = context[:, D:]   # (B, D, h, w)
 
-        # Pre-norm on query (in channel-first layout)
-        q_normed = self.norm_q(query)                       # (B, D, h, w)
-
         # Q / K / V projections  (1×1 conv, channel-first)
-        Q = self.q_proj(q_normed)                           # (B, D, h, w)
+        Q = self.q_proj(query)                              # (B, D, h, w)
         K0 = self.k_proj(ctx0)                              # (B, D, h, w)
         K1 = self.k_proj(ctx1)                              # (B, D, h, w)  shared weights
         V0 = self.v_proj(ctx0)                              # (B, D, h, w)
@@ -291,9 +309,8 @@ class SphericalTemporalCrossAttentionBlock(nn.Module):
         # Re-assemble spatial layout: (B, H, N, d) → (B, D, h, w)
         out = attn_out.permute(0, 1, 3, 2).reshape(B, D, h, w)
         out = self.out_proj(out)                            # (B, D, h, w)
-        out = self.norm_out(out)
 
-        # Residual from (unnormalised) query
+        # Residual from query
         return out + query
 
 
@@ -342,12 +359,9 @@ class TemporalInterpolationNet(Module):
     embed_dim:
         Latent feature width ``D``.
     num_layers:
-        Number of :class:`SphericalTransformerBlock` processor layers.
+        Number of global S2 self-attention processor layers (default 1).
     num_heads:
         Number of attention heads (must divide ``embed_dim``).
-    attn_theta_cutoff_factor:
-        Neighborhood radius for processor blocks, in units of latitude
-        rings on the bottleneck grid.
     encoder_theta_cutoff_factor:
         Neighborhood radius for the S2 encoder block.
     decoder_theta_cutoff_factor:
@@ -356,8 +370,6 @@ class TemporalInterpolationNet(Module):
         Number of sinusoidal feature pairs in the temporal query map.
     mlp_ratio:
         Hidden-size multiplier inside each ``SphericalTransformerBlock`` MLP.
-    normalization_layer:
-        ``"layer_norm"`` or ``"none"``; applied inside processor blocks.
     path_drop_rate:
         Stochastic-depth drop rate (applied uniformly to all processor blocks).
     checkpointing_level:
@@ -381,14 +393,12 @@ class TemporalInterpolationNet(Module):
         model_grid_type: str = "equiangular",
         sht_grid_type: str = "legendre-gauss",
         embed_dim: int = 128,
-        num_layers: int = 2,
+        num_layers: int = 1,
         num_heads: int = 8,
-        attn_theta_cutoff_factor: float = 4.0,
         encoder_theta_cutoff_factor: float = 4.0,
         decoder_theta_cutoff_factor: float = 4.0,
         n_fourier: int = 32,
         mlp_ratio: float = 2.0,
-        normalization_layer: str = "layer_norm",
         path_drop_rate: float = 0.0,
         checkpointing_level: int = 0,
         upsample_sht: bool = False,
@@ -455,7 +465,7 @@ class TemporalInterpolationNet(Module):
         # ----------------------------------------------------------------
         # 3. Target-time query map  τ → (B, D, h, w)
         # ----------------------------------------------------------------
-        self.query_map = TemporalQueryMap(embed_dim, h, w, n_fourier=n_fourier)
+        self.query_map = TemporalQueryMap(embed_dim, h, w, grid=sht_grid_type, n_fourier=n_fourier)
 
         # ----------------------------------------------------------------
         # 4. Spherical cross-attention  Q: query map,  KV: 2-frame context
@@ -469,15 +479,12 @@ class TemporalInterpolationNet(Module):
             grid=sht_grid_type,
             bias=bias,
         )
-        # GroupNorm on the concatenated 2-frame context before cross-attn.
-        self.context_norm = nn.GroupNorm(1, 2 * embed_dim, eps=1e-6)
 
         # ----------------------------------------------------------------
-        # 5. Processor blocks (SphericalTransformerBlocks at bottleneck)
+        # 5. Processor blocks — global S2 self-attention at bottleneck
+        #    AttentionS2 sees every spatial token on the sphere and uses
+        #    quadrature-weighted softmax internally; no radius cutoff needed.
         # ----------------------------------------------------------------
-        from .attention_net import _neighborhood_radius_rad
-        attn_cutoff = _neighborhood_radius_rad(h, attn_theta_cutoff_factor)
-
         dpr = [float(x) for x in torch.linspace(0, path_drop_rate, max(1, num_layers))]
         self.blocks = nn.ModuleList([
             SphericalTransformerBlock(
@@ -486,11 +493,10 @@ class TemporalInterpolationNet(Module):
                 in_chans=embed_dim,
                 out_chans=embed_dim,
                 num_heads=num_heads,
-                attention_mode="neighborhood",
-                attn_theta_cutoff=attn_cutoff,
+                attention_mode="global",
                 mlp_ratio=mlp_ratio,
                 path_drop_rate=dpr[i],
-                normalization_layer=normalization_layer,
+                normalization_layer="none",
                 bias=bias,
                 use_mlp=True,
                 qk_norm=qk_norm,
@@ -571,7 +577,6 @@ class TemporalInterpolationNet(Module):
 
         # 2. Form context: (B, 2D, h, w)
         context = self._build_context(z0, z1)
-        context = self.context_norm(context)
 
         # 3. Target-time query map: (B, D, h, w)
         tau = tau.to(dtype=x.dtype, device=x.device)
