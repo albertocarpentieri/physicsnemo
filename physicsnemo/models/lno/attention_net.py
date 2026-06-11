@@ -64,14 +64,23 @@ class AttentionEncoder(nn.Module):
 
     Pipeline:
 
-    1. Pointwise 1x1 lift ``in_chans -> out_chans`` on the input grid. Keeps
-       the attention at a clean ``num_heads``-divisible channel count even
-       when ``in_chans`` (e.g. 78 state+invariants) is awkward.
-    2. :class:`NeighborhoodAttentionS2` downsampling from ``in_shape`` to
-       ``out_shape`` with geodesic-cap radius ``theta_cutoff``.
+    1. Pointwise 1x1 lift ``in_chans -> out_chans`` on the input grid.
+    2. :class:`NeighborhoodAttentionS2` **cross-resolution downsampling**:
+       the attention itself aggregates from the full-resolution K/V tokens to
+       the coarse Q positions, so no explicit resampling module is needed.
 
-    Requires ``nlon_in % nlon_out == 0`` (a hard constraint of the underlying
-    spherical attention kernel — same as it is for DISCO downsampling).
+       Following the updated torch-harmonics API, Q must be at ``out_shape``
+       and K/V at ``in_shape``.  Q is initialised by
+       ``F.adaptive_avg_pool2d`` — a cheap positional pointer that defines
+       *where* each output token is; all spatial information is gathered
+       from the full-resolution K/V by the attention.
+
+       An optional positional embedding (``pos_embed``, assigned externally)
+       is added to Q after the pool and before the attention so the output
+       tokens know their position on the sphere.
+
+    Requires ``nlon_in % nlon_out == 0`` (a hard constraint of the
+    underlying spherical attention kernel).
     """
 
     def __init__(
@@ -94,17 +103,28 @@ class AttentionEncoder(nn.Module):
                 f"AttentionEncoder: out_chans ({out_chans}) must be divisible by "
                 f"num_heads ({num_heads})."
             )
-        if inp_shape[1] % out_shape[1] != 0:
-            raise ValueError(
-                f"AttentionEncoder: nlon_in ({inp_shape[1]}) must be a multiple of "
-                f"nlon_out ({out_shape[1]}) for the spherical attention p-shift."
-            )
 
         self.lift = nn.Conv2d(in_chans, out_chans, kernel_size=1, bias=bias)
         nn.init.normal_(self.lift.weight, std=math.sqrt(2.0 / max(1, in_chans)))
         if bias:
             nn.init.zeros_(self.lift.bias)
 
+        # Spherically-correct bilinear downsample to the latent grid.
+        # Used both as the residual base and as Q seed for the cross-attention.
+        self._needs_resample = (inp_shape != out_shape)
+        if self._needs_resample:
+            self.resample = th.ResampleS2(
+                inp_shape[0], inp_shape[1],
+                out_shape[0], out_shape[1],
+                grid_in=grid_in,
+                grid_out=grid_out,
+            )
+
+        # Optional spatial PE applied to Q only (assigned externally).
+        self.pos_embed: Optional[nn.Module] = None
+
+        # Cross-resolution attention: K/V at inp_shape, Q at out_shape.
+        # Output is added as a residual on top of the bilinear downsample.
         theta_cutoff = _neighborhood_radius_rad(inp_shape[0], theta_cutoff_factor)
         self.attn = th.NeighborhoodAttentionS2(
             in_channels=out_chans,
@@ -121,11 +141,23 @@ class AttentionEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # NeighborhoodAttentionS2's optimized kernel runs in fp32 only.
-        x = self.lift(x)
+        x = self.lift(x)    # (B, D, H, W)
         dtype = x.dtype
         with amp.autocast(device_type=x.device.type, enabled=False):
-            x = self.attn(x.float()).to(dtype)
+            x_f = x.float()
+            if self._needs_resample:
+                # Residual base: spherically-correct bilinear downsample.
+                q_base = self.resample(x_f)                      # (B, D, h, w)
+                # Q for attention: add spatial PE so attention is position-aware.
+                q_attn = self.pos_embed(q_base) if self.pos_embed is not None else q_base
+                # Cross-attention correction: what the full-resolution input adds
+                # beyond the bilinear base.
+                delta = self.attn(q_attn, key=x_f, value=x_f)   # (B, D, h, w)
+                x = (q_base + delta).to(dtype)                   # residual
+            else:
+                # Same shape: plain self-attention, no downsampling.
+                q = self.pos_embed(x_f) if self.pos_embed is not None else x_f
+                x = (x_f + self.attn(q)).to(dtype)
         return x
 
 
@@ -217,20 +249,66 @@ class AttentionDecoder(nn.Module):
 class _SpectralPositionEmbedding(nn.Module):
     """Spherical-harmonic positional embedding (channel-wise basis function).
 
-    Channel ``i`` is the ``i``-th real spherical harmonic on the (h, w) grid,
-    normalised to unit max amplitude. Cheap, deterministic, and well-suited
-    to spherical transformer pretraining.
+    Each channel is one real spherical harmonic on the (h, w) grid, normalised
+    to unit max amplitude. Cheap, deterministic, and well-suited to spherical
+    transformer pretraining.
+
+    Degree coverage (``max_degree``):
+
+    - ``None`` (default): channel ``i`` is the ``i``-th harmonic in the
+      standard ``(l, m)`` enumeration, so for ``num_chans`` channels the degree
+      only reaches ``l ≈ ⌊√num_chans⌋``.  With ``num_chans=256`` that is just
+      ``l≤15`` (spatial wavelength ~11°) — too low-frequency to let attention
+      localise inside a small geodesic neighbourhood (→ blurry outputs).
+    - integer: spread ``num_chans`` harmonics evenly (in enumeration index)
+      over degrees ``0 … max_degree``, so the embedding carries high-frequency
+      components (wavelength ~``180°/max_degree``) and can resolve fine
+      position differences, while still including the smooth low-degree modes.
+      ``max_degree`` is clamped to the grid bandlimit.
     """
 
-    def __init__(self, grid_shape: Tuple[int, int], num_chans: int, grid: str):
+    def __init__(
+        self,
+        grid_shape: Tuple[int, int],
+        num_chans: int,
+        grid: str,
+        max_degree: Optional[int] = None,
+    ):
         super().__init__()
         H, W = int(grid_shape[0]), int(grid_shape[1])
         isht = InverseRealSHT(nlat=H, nlon=W, grid=grid)
-        with torch.no_grad():
-            pos_freq = torch.zeros(1, num_chans, isht.lmax, isht.mmax, dtype=torch.complex64)
+
+        # Build the list of (l, m) harmonics assigned to each channel.
+        if max_degree is None:
+            # Legacy: the first ``num_chans`` harmonics (all low-degree).
+            pairs = []
             for i in range(num_chans):
                 l = math.floor(math.sqrt(i))
                 m = i - l * l - l
+                pairs.append((l, m))
+        else:
+            # Spread across degrees 0..L (clamped to the grid bandlimit), so
+            # high-frequency harmonics are included for sharp localisation.
+            L = max(0, min(int(max_degree), int(isht.lmax) - 1))
+            all_pairs = [
+                (l, m)
+                for l in range(L + 1)
+                for m in range(-l, l + 1)
+                if abs(m) < int(isht.mmax)
+            ]
+            if len(all_pairs) >= num_chans:
+                idx = torch.linspace(0, len(all_pairs) - 1, num_chans).round().long().tolist()
+                pairs = [all_pairs[j] for j in idx]
+            else:
+                # Fewer harmonics than channels (tiny grids): cycle through.
+                pairs = [all_pairs[j % len(all_pairs)] for j in range(num_chans)]
+
+        with torch.no_grad():
+            pos_freq = torch.zeros(1, num_chans, isht.lmax, isht.mmax, dtype=torch.complex64)
+            for i, (l, m) in enumerate(pairs):
+                # Guard against out-of-range indices on small grids.
+                if l >= isht.lmax or abs(m) >= isht.mmax:
+                    continue
                 if m < 0:
                     pos_freq[0, i, l, -m] = 1.0j
                 else:
@@ -474,9 +552,15 @@ class PrecipAttentionNet(Module):
     ``normalization_layer``, ``checkpointing_level``, etc.; same
     ``forward(x, noise=None)`` signature.
 
+    The internal (processor) grid is either derived from ``scale_factor``
+    (``h, w = inp_shape // scale_factor``) or set explicitly via
+    ``latent_shape=(h, w)``, which takes precedence. The latent longitude
+    ``w`` MUST divide the input longitude (spherical-attention p-shift);
+    latitude ``h`` is free.
+
     ``use_encoder=False`` / ``use_decoder=False`` skip the spherical-attention
-    encoder/decoder (no spatial up/downsampling), so ``scale_factor`` must be
-    ``1``. Channel routing in that case mirrors :class:`PrecipNeuralOperatorNet`:
+    encoder/decoder (no spatial up/downsampling), so the processor grid must
+    equal the input grid (``scale_factor=1`` or ``latent_shape=inp_shape``). Channel routing in that case mirrors :class:`PrecipNeuralOperatorNet`:
     the first block's input channel count is ``in_channels`` (instead of
     ``embed_dim``) and/or the last block's output channel count is
     ``out_channels``; the channel change happens inside the block's MLP, and
@@ -522,6 +606,7 @@ class PrecipAttentionNet(Module):
         in_channels: int = 27,
         out_channels: int = 1,
         scale_factor: int = 8,
+        latent_shape: Optional[Tuple[int, int]] = None,
         upsample_sht: bool = False,
         channel_names: Optional[List[str]] = None,
         n_history: int = 0,
@@ -582,9 +667,24 @@ class PrecipAttentionNet(Module):
         else:
             raise ValueError(f"Unknown activation function {activation_function}")
 
-        # Internal (processor) spatial shape.
-        self.h = int(self.inp_shape[0] // scale_factor)
-        self.w = int(self.inp_shape[1] // scale_factor)
+        # Internal (processor) spatial shape. Two ways to specify it:
+        #   1. latent_shape=(h, w) — explicit, takes precedence.
+        #   2. scale_factor — h,w = inp_shape // scale_factor.
+        # The latent longitude (w) MUST divide the input longitude (a hard
+        # constraint of the spherical-attention p-shift kernel); latitude (h)
+        # is free.
+        if latent_shape is not None:
+            self.h = int(latent_shape[0])
+            self.w = int(latent_shape[1])
+        else:
+            self.h = int(self.inp_shape[0] // scale_factor)
+            self.w = int(self.inp_shape[1] // scale_factor)
+        if self.use_encoder and self.inp_shape[1] % self.w != 0:
+            raise ValueError(
+                f"PrecipAttentionNet: latent longitude w={self.w} must divide "
+                f"input longitude W={self.inp_shape[1]} (spherical-attention "
+                f"p-shift). Pick a w that divides {self.inp_shape[1]}."
+            )
 
         # Encoder/decoder mirror the LNO convention: when off they are pure
         # nn.Identity() and the channel routing in_channels -> embed_dim ->
