@@ -514,50 +514,27 @@ class _SpectralPositionEmbedding(nn.Module):
         return x + self.position_embeddings
 
 
-class _LearnableLatitudePositionEmbedding(nn.Module):
-    r"""Per-latitude learnable bias (broadcast across longitudes).
-
-    Lightweight alternative to the spectral embedding when you do not want to pay
-    for an SHT at init time. A ``(1, C, H, 1)`` parameter is broadcast against
-    every longitude.
-
-    Parameters
-    ----------
-    grid_shape : tuple of int
-        Grid shape :math:`(h, w)` the embedding is defined on.
-    num_chans : int
-        Number of channels.
-    """
-
-    def __init__(self, grid_shape: Tuple[int, int], num_chans: int):
-        super().__init__()
-        H = int(grid_shape[0])
-        self.position_embeddings = nn.Parameter(torch.zeros(1, num_chans, H, 1))
-        nn.init.normal_(self.position_embeddings, std=0.02)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Add the (broadcast) per-latitude bias to ``x``."""
-        return x + self.position_embeddings
-
-
 def _build_pos_embedding(
     kind: str,
     grid_shape: Tuple[int, int],
     num_chans: int,
     grid: str,
+    max_degree: Optional[int] = None,
 ) -> nn.Module:
     """Build the positional-embedding module selected by ``kind``.
 
     Parameters
     ----------
     kind : str
-        One of ``"none"``, ``"spectral"``, ``"learnable_lat"``.
+        One of ``"none"`` or ``"spectral"``.
     grid_shape : tuple of int
         Grid shape :math:`(h, w)`.
     num_chans : int
         Number of channels.
     grid : str
         Quadrature grid type (used by the spectral embedding).
+    max_degree : int, optional, default=None
+        Maximum spherical-harmonic degree for the spectral embedding.
 
     Returns
     -------
@@ -568,11 +545,11 @@ def _build_pos_embedding(
     if kind == "none":
         return nn.Identity()
     if kind == "spectral":
-        return _SpectralPositionEmbedding(grid_shape, num_chans, grid)
-    if kind in ("learnable_lat", "learnable"):
-        return _LearnableLatitudePositionEmbedding(grid_shape, num_chans)
+        return _SpectralPositionEmbedding(
+            grid_shape, num_chans, grid, max_degree=max_degree
+        )
     raise ValueError(
-        f"Unknown pos_embed='{kind}'. Supported: 'none', 'spectral', 'learnable_lat'."
+        f"Unknown pos_embed='{kind}'. Supported: 'none', 'spectral'."
     )
 
 
@@ -887,7 +864,12 @@ class PrecipAttentionNet(Module):
     mlp_drop_rate : float, optional, default=0.0
         Dropout rate inside the MLP sublayers.
     pos_embed : str, optional, default="spectral"
-        One of ``"none"``, ``"spectral"``, ``"learnable_lat"``.
+        One of ``"none"`` or ``"spectral"`` (a fixed, non-learnable
+        spherical-harmonic embedding).
+    pos_embed_max_degree : int, optional, default=None
+        Maximum spherical-harmonic degree for the ``"spectral"`` embedding
+        (higher = finer positional resolution). ``None`` uses the low-degree
+        default enumeration.
     normalization_layer : str, optional, default="layer_norm"
         One of ``"none"``, ``"layer_norm"``, ``"instance_norm"``.
     encoder_theta_cutoff_factor : float, optional, default=1.0
@@ -956,6 +938,7 @@ class PrecipAttentionNet(Module):
         path_drop_rate: float = 0.0,
         mlp_drop_rate: float = 0.0,
         pos_embed: str = "spectral",
+        pos_embed_max_degree: Optional[int] = None,
         normalization_layer: str = "layer_norm",
         encoder_theta_cutoff_factor: float = 1.0,
         decoder_theta_cutoff_factor: float = 1.0,
@@ -1113,7 +1096,11 @@ class PrecipAttentionNet(Module):
         first_in_ch = _block_in_ch(0)
         self.pos_drop = nn.Dropout(p=pos_drop_rate) if pos_drop_rate > 0.0 else nn.Identity()
         self.pos_embed = _build_pos_embedding(
-            pos_embed, (self.h, self.w), first_in_ch, sht_grid_type
+            pos_embed,
+            (self.h, self.w),
+            first_in_ch,
+            sht_grid_type,
+            max_degree=pos_embed_max_degree,
         )
 
         dpr = [
