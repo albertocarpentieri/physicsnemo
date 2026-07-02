@@ -319,6 +319,11 @@ datapipes-extras = [
 uq-extras = [
     "gpytorch>=1.11",
 ]
+# Spherical-harmonics extras: required by the spherical transformer
+# (S2Transformer) models in physicsnemo.experimental.models.s2transformer.
+harmonics = [
+    "torch_harmonics>=0.7.0",
+]
 
 # Use case specific dependency groups.
 gnns = [
