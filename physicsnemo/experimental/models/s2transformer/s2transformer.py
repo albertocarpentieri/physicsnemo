@@ -278,17 +278,32 @@ class AttentionEncoder(nn.Module):
 class AttentionDecoder(nn.Module):
     r"""Spherical-attention decoder: ``(in_chans, h, w) -> (out_chans, H_out, W_out)``.
 
-    Pipeline:
+    Mirror of :class:`AttentionEncoder`. When the latent and output grids differ,
+    the decoder upsamples with a spherically-correct bilinear
+    :class:`~torch_harmonics.ResampleS2` (or an SHT round-trip when
+    ``upsample_sht=True``) and adds a learned cross-resolution "attnup"
+    correction on top of that base:
 
-    1. Upsample with :class:`~torch_harmonics.ResampleS2` (SLERP-style on the
-       sphere) or with an SHT round-trip when ``upsample_sht=True``. Spherical
-       attention only supports ``nlon_in % nlon_out == 0``, so the up-sample has
-       to come first.
-    2. :class:`~torch_harmonics.NeighborhoodAttentionS2` at the output grid for
-       local refinement (``attn_dim -> attn_dim``).
-    3. Pointwise 1x1 projection ``attn_dim -> out_chans``. Decoupling the channel
-       projection from the attention keeps things well-defined when ``out_chans``
-       (e.g. 1 for precip) is not divisible by ``num_heads``.
+    .. code-block:: text
+
+        kv   = reduce(z)                          # optional attn_dim bottleneck (latent grid)
+        base = upsample(kv)                       # -> output grid (residual base)
+        q    = base + pos_embed                   # position-aware query on the output grid
+        x    = base + attn(q, key=kv, value=kv)   # cross-resolution upsampling attention
+        out  = project(x)                         # attn_dim -> out_chans
+
+    Only the query is at the output resolution; K/V stay on the cheap latent grid.
+    When the latent grid already equals the output grid (no resolution change) the
+    upsample, positional embedding and attention are skipped entirely and the
+    decoder degenerates to the pointwise channel projection (``reduce`` ->
+    ``project``) -- exactly mirroring the encoder, whose attention only runs when
+    resampling.
+
+    The cross-resolution upsampling attention requires ``nlon_out % nlon_in == 0``.
+    ``theta_cutoff_factor`` is a geodesic cap on the OUTPUT grid; the latent K/V
+    spacing is ~``H_out / h`` output rings, so pick a factor at least as large as
+    the up-sampling ratio (~``scale_factor``) so every fine query reaches >= 1
+    coarse point.
 
     Parameters
     ----------
@@ -307,7 +322,8 @@ class AttentionDecoder(nn.Module):
     num_heads : int
         Number of attention heads.
     theta_cutoff_factor : float
-        Neighborhood radius (in latitude rings) for the refinement attention.
+        Neighborhood radius (in output-grid latitude rings) for the upsampling
+        attention. Use a value at least as large as the up-sampling ratio.
     qk_norm : bool
         Whether to apply RMSNorm to the query/key projections.
     bias : bool
@@ -317,8 +333,10 @@ class AttentionDecoder(nn.Module):
     upsample_sht : bool, optional, default=False
         Whether to upsample with an SHT round-trip instead of :class:`~torch_harmonics.ResampleS2`.
     attn_dim : int, optional, default=None
-        Channel width at which the (expensive, full-resolution) self-attention
-        runs. ``None`` means no bottleneck (``in_chans``).
+        Channel width at which the (full-resolution) attention query runs.
+        ``None`` means no bottleneck (``in_chans``).
+    pos_embed_max_degree : int, optional, default=None
+        Maximum spherical-harmonic degree for the query positional embedding.
     """
 
     def __init__(
@@ -336,23 +354,23 @@ class AttentionDecoder(nn.Module):
         attn_optimized_kernel: bool,
         upsample_sht: bool = False,
         attn_dim: Optional[int] = None,
+        pos_embed_max_degree: Optional[int] = None,
     ):
         super().__init__()
         self.in_chans = int(in_chans)
-        # Channel width at which the (expensive, full-resolution) self-attention
-        # runs. ``None`` -> in_chans (no bottleneck). When set smaller, a cheap
-        # 1x1 conv at the LATENT grid reduces in_chans -> attn_dim BEFORE the
-        # upsample, so both the upsample and the full-res attention run narrow;
+        self._needs_resample = inp_shape != out_shape
+        # Channel width at which the (full-resolution) attention query runs.
+        # ``None`` -> in_chans (no bottleneck). When set smaller, a cheap 1x1 conv
+        # at the LATENT grid reduces in_chans -> attn_dim before the attnup, and
         # the final projection maps attn_dim -> out_chans.
         self.attn_dim = int(attn_dim) if attn_dim else self.in_chans
-        if self.attn_dim % num_heads != 0:
+        if self._needs_resample and self.attn_dim % num_heads != 0:
             raise ValueError(
                 f"AttentionDecoder: attn_dim ({self.attn_dim}) must be divisible by "
                 f"num_heads ({num_heads})."
             )
 
-        # Reduce in_chans -> attn_dim at the latent grid (cheap, low-res).
-        # Identity when not bottlenecking.
+        # Optional channel bottleneck at the cheap latent grid (Identity when off).
         if self.attn_dim != self.in_chans:
             self.reduce = nn.Conv2d(self.in_chans, self.attn_dim, kernel_size=1, bias=bias)
             nn.init.normal_(self.reduce.weight, std=math.sqrt(2.0 / max(1, self.in_chans)))
@@ -361,42 +379,53 @@ class AttentionDecoder(nn.Module):
         else:
             self.reduce = nn.Identity()
 
-        # Skip the spatial up-sample when the latent already equals the output
-        # grid (resolution-invariant use: the decoder is "active" for its
-        # attention + projection but performs NO resampling). ResampleS2/SHT
-        # carry no learnable params, so this Identity swap keeps the weight set
-        # identical to the resampling case.
-        self._needs_resample = inp_shape != out_shape
-        if not self._needs_resample:
-            self.upsample = nn.Identity()
-        elif upsample_sht:
-            sht = th.RealSHT(*inp_shape, grid=grid_in).float()
-            isht = th.InverseRealSHT(
-                *out_shape,
-                lmax=sht.lmax,
-                mmax=sht.mmax,
-                grid=grid_out,
-            ).float()
-            self.upsample = nn.Sequential(sht, isht)
-        else:
-            self.upsample = th.ResampleS2(
-                *inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out
+        # The upsample, positional-embedding query and cross-resolution attention
+        # only exist when the decoder actually changes resolution. When
+        # inp_shape == out_shape the decoder degenerates to the pointwise
+        # projection (mirrors the encoder).
+        if self._needs_resample:
+            # Bilinear-spherical (or SHT) upsample latent -> output grid: both the
+            # residual base and the source of the attention query.
+            if upsample_sht:
+                sht = th.RealSHT(*inp_shape, grid=grid_in).float()
+                isht = th.InverseRealSHT(
+                    *out_shape,
+                    lmax=sht.lmax,
+                    mmax=sht.mmax,
+                    grid=grid_out,
+                ).float()
+                self.upsample = nn.Sequential(sht, isht)
+            else:
+                self.upsample = th.ResampleS2(
+                    *inp_shape, *out_shape, grid_in=grid_in, grid_out=grid_out
+                )
+
+            # Position-aware query on the OUTPUT grid (non-persistent buffer, not
+            # in the state dict; recomputed for whatever grid is requested).
+            self.pos_embed: Optional[nn.Module] = _SpectralPositionEmbedding(
+                out_shape, self.attn_dim, grid_out, max_degree=pos_embed_max_degree,
             )
 
-        theta_cutoff = _neighborhood_radius_rad(out_shape[0], theta_cutoff_factor)
-        self.attn = th.NeighborhoodAttentionS2(
-            in_channels=self.attn_dim,
-            in_shape=out_shape,
-            out_shape=out_shape,
-            grid_in=grid_out,
-            grid_out=grid_out,
-            num_heads=num_heads,
-            theta_cutoff=theta_cutoff,
-            use_qknorm=qk_norm,
-            bias=bias,
-            out_channels=self.attn_dim,
-            optimized_kernel=attn_optimized_kernel,
-        )
+            # Cross-resolution UPSAMPLING attention: K/V at the latent (inp_shape),
+            # Q at the output (out_shape). Requires nlon_out % nlon_in == 0.
+            theta_cutoff = _neighborhood_radius_rad(out_shape[0], theta_cutoff_factor)
+            self.attn: Optional[nn.Module] = th.NeighborhoodAttentionS2(
+                in_channels=self.attn_dim,
+                in_shape=inp_shape,
+                out_shape=out_shape,
+                grid_in=grid_in,
+                grid_out=grid_out,
+                num_heads=num_heads,
+                theta_cutoff=theta_cutoff,
+                use_qknorm=qk_norm,
+                bias=bias,
+                out_channels=self.attn_dim,
+                optimized_kernel=attn_optimized_kernel,
+            )
+        else:
+            self.upsample = nn.Identity()
+            self.pos_embed = None
+            self.attn = None
 
         self.project = nn.Conv2d(self.attn_dim, out_chans, kernel_size=1, bias=bias)
         nn.init.normal_(self.project.weight, std=math.sqrt(2.0 / max(1, self.attn_dim)))
@@ -406,14 +435,17 @@ class AttentionDecoder(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Decode ``x`` of shape :math:`(B, C_{in}, h, w)` to :math:`(B, C_{out}, H_{out}, W_{out})`."""
         x = self.reduce(x)  # (B, attn_dim, h, w)
+        if not self._needs_resample:
+            # No resolution change: pointwise channel projection only.
+            return self.project(x)
         dtype = x.dtype
         with amp.autocast(device_type=x.device.type, enabled=False):
-            x = x.float()
-            x = self.upsample(x)
-            x = self.attn(x)
-        x = x.to(dtype)
-        x = self.project(x)
-        return x
+            kv = x.float()                          # (B, attn_dim, h, w)
+            base = self.upsample(kv)                # (B, attn_dim, H, W)
+            q = self.pos_embed(base)                # base + PE (position-aware query)
+            delta = self.attn(q, key=kv, value=kv)  # (B, attn_dim, H, W)
+            x = (base + delta).to(dtype)            # residual on the bilinear base
+        return self.project(x)                      # (B, out_chans, H, W)
 
 
 # -----------------------------------------------------------------------------
