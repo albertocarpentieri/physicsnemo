@@ -704,6 +704,7 @@ class SphericalTransformerBlock(nn.Module):
         qk_norm: bool = False,
         attn_optimized_kernel: bool = True,
         checkpointing_level: int = 0,
+        film_dim: int = 0,
     ):
         super().__init__()
 
@@ -777,6 +778,24 @@ class SphericalTransformerBlock(nn.Module):
         # residual is only applied when in_chans == out_chans.
         self._mlp_residual = self.in_chans == self.out_chans
 
+        # Optional conditional (FiLM) modulation of the two pre-norm streams. Each
+        # head maps a shared per-sample conditioning embedding -> per-channel
+        # (scale, shift). The heads are ZERO-initialised so that at init (and
+        # whenever the conditioning embedding is absent) the modulation is the
+        # identity ``h -> h * (1 + 0) + 0 = h``. This makes warm-starting from a
+        # deterministic checkpoint EXACT: the conditional path contributes nothing
+        # until trained. (FiLM-Ensemble, NeurIPS 2022; AIFS-CRPS conditioning.)
+        self.film_dim = int(film_dim)
+        if self.film_dim > 0:
+            self.film0 = nn.Linear(self.film_dim, 2 * in_chans)
+            self.film1 = nn.Linear(self.film_dim, 2 * in_chans)
+            for _h in (self.film0, self.film1):
+                nn.init.zeros_(_h.weight)
+                nn.init.zeros_(_h.bias)
+        else:
+            self.film0 = None
+            self.film1 = None
+
     def _attn_forward(self, x: torch.Tensor) -> torch.Tensor:
         # NeighborhoodAttentionS2's optimized CUDA kernel only supports FP32,
         # so we disable autocast around it. AttentionS2 handles autocast natively.
@@ -786,16 +805,31 @@ class SphericalTransformerBlock(nn.Module):
                 return self.self_attn(x.float()).to(dtype)
         return self.self_attn(x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply the pre-norm attention + MLP block to ``x`` of shape :math:`(B, C, h, w)`."""
+    @staticmethod
+    def _apply_film(h: torch.Tensor, head: nn.Module, film_embed: torch.Tensor) -> torch.Tensor:
+        gamma, beta = head(film_embed).chunk(2, dim=-1)          # (B, C) each
+        gamma = gamma.unsqueeze(-1).unsqueeze(-1).to(h.dtype)    # (B, C, 1, 1)
+        beta = beta.unsqueeze(-1).unsqueeze(-1).to(h.dtype)
+        return h * (1.0 + gamma) + beta
+
+    def forward(self, x: torch.Tensor, film_embed: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Apply the pre-norm attention + MLP block to ``x`` of shape :math:`(B, C, h, w)`.
+
+        If ``film_embed`` is provided and FiLM heads exist, each pre-norm stream is
+        modulated by a per-channel (scale, shift) derived from ``film_embed``.
+        """
         residual = x
         h = self.norm0(x)
+        if self.film0 is not None and film_embed is not None:
+            h = self._apply_film(h, self.film0, film_embed)
         h = self._attn_forward(h)
         x = residual + self.drop_path0(h)
 
         if self.mlp is not None:
             residual = x
             h = self.norm1(x)
+            if self.film1 is not None and film_embed is not None:
+                h = self._apply_film(h, self.film1, film_embed)
             h = self.mlp(h)
             h = self.drop_path1(h)
             x = residual + h if self._mlp_residual else h
@@ -921,9 +955,18 @@ class PrecipAttentionNet(Module):
     checkpointing_level : int, optional, default=0
         Activation-checkpointing aggressiveness.
     noise_mode : str, optional, default=None
-        Reserved for API parity; must be ``None`` (no stochastic conditioning).
+        Stochastic conditioning mode. ``None`` disables it (purely deterministic).
+        ``"film"`` enables FiLM conditioning: a per-sample latent modulates every
+        processor block's pre-norm streams via zero-init (scale, shift) heads, so
+        a deterministic checkpoint warm-starts exactly and gains diversity only
+        once trained. Pass the latent to ``forward(..., film_latent=z)``.
     noise_channels : int, optional, default=1
         Reserved for API parity.
+    film_latent_dim : int, optional, default=64
+        Dimension of the per-sample FiLM latent (used only when ``noise_mode='film'``).
+    film_hidden : int, optional, default=0
+        Hidden/embedding width of the FiLM conditioning MLP. ``0`` uses
+        ``max(64, embed_dim)``.
 
     Example
     -------
@@ -982,6 +1025,8 @@ class PrecipAttentionNet(Module):
         checkpointing_level: int = 0,
         noise_mode: Optional[str] = None,
         noise_channels: int = 1,
+        film_latent_dim: int = 64,
+        film_hidden: int = 0,
         **kwargs,
     ):
         super().__init__(meta=MetaData())
@@ -995,10 +1040,10 @@ class PrecipAttentionNet(Module):
             )
         if n_history != 0:
             raise ValueError("PrecipAttentionNet currently only supports n_history=0.")
-        if noise_mode is not None:
+        if noise_mode not in (None, "film"):
             raise NotImplementedError(
-                "PrecipAttentionNet does not (yet) support noise conditioning; "
-                "set noise_mode=None."
+                f"PrecipAttentionNet supports noise_mode in (None, 'film'); "
+                f"got {noise_mode!r}."
             )
 
         self.inp_shape = tuple(inp_shape)
@@ -1011,6 +1056,25 @@ class PrecipAttentionNet(Module):
         self.use_decoder = bool(use_decoder)
         self.big_skip = bool(big_skip)
         self.checkpointing_level = int(checkpointing_level)
+
+        # FiLM ("film") stochastic conditioning: a per-sample latent vector is
+        # turned into a shared embedding that every processor block's zero-init
+        # FiLM head maps to per-channel (scale, shift). It does NOT change the
+        # input channel count, so a deterministic (noise_mode=None) checkpoint
+        # warm-starts exactly. noise_mode=None disables it entirely.
+        self.noise_mode = noise_mode
+        self.film_latent_dim = int(film_latent_dim) if noise_mode == "film" else 0
+        self._film_dim = 0
+        if self.noise_mode == "film":
+            self._film_dim = int(film_hidden) if film_hidden else max(64, self.embed_dim)
+            self.film_embed = nn.Sequential(
+                nn.Linear(self.film_latent_dim, self._film_dim),
+                nn.SiLU(),
+                nn.Linear(self._film_dim, self._film_dim),
+                nn.LayerNorm(self._film_dim),
+            )
+        else:
+            self.film_embed = None
 
         if activation_function == "relu":
             act_layer = nn.ReLU
@@ -1159,6 +1223,7 @@ class PrecipAttentionNet(Module):
                     qk_norm=qk_norm,
                     attn_optimized_kernel=attn_optimized_kernel,
                     checkpointing_level=self.checkpointing_level,
+                    film_dim=self._film_dim,
                 )
                 for i in range(self.num_layers)
             ]
@@ -1183,18 +1248,23 @@ class PrecipAttentionNet(Module):
         """Decode the processor output back to the output grid."""
         return self.decoder(x)
 
-    def processor_blocks(self, x: torch.Tensor) -> torch.Tensor:
+    def processor_blocks(
+        self, x: torch.Tensor, film_embed: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """Apply positional embedding and the stack of processor blocks."""
         x = self.pos_embed(self.pos_drop(x))
         for blk in self.blocks:
             if self.checkpointing_level >= 3:
-                x = checkpoint(blk, x, use_reentrant=False)
+                x = checkpoint(blk, x, film_embed, use_reentrant=False)
             else:
-                x = blk(x)
+                x = blk(x, film_embed=film_embed)
         return x
 
     def forward(
-        self, x: torch.Tensor, noise: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        noise: Optional[torch.Tensor] = None,
+        film_latent: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the full encoder / processor / decoder network.
 
@@ -1204,6 +1274,10 @@ class PrecipAttentionNet(Module):
             Input tensor of shape :math:`(B, C_{in}, H_{in}, W_{in})`.
         noise : torch.Tensor, optional, default=None
             Reserved for API parity; must be ``None``.
+        film_latent : torch.Tensor, optional, default=None
+            Per-sample conditioning latent of shape :math:`(B, film\\_latent\\_dim)`,
+            used only when ``noise_mode='film'``. When absent, the zero-init FiLM
+            heads make the network reproduce its deterministic mean map.
 
         Returns
         -------
@@ -1214,6 +1288,11 @@ class PrecipAttentionNet(Module):
             raise NotImplementedError(
                 "PrecipAttentionNet does not (yet) support noise conditioning."
             )
+        film_embed = None
+        if self.noise_mode == "film" and film_latent is not None:
+            film_embed = self.film_embed(
+                film_latent.to(dtype=self.film_embed[0].weight.dtype)
+            )
         residual = x.contiguous() if self.big_skip else None
 
         if self.checkpointing_level >= 1:
@@ -1221,7 +1300,7 @@ class PrecipAttentionNet(Module):
         else:
             x = self.encode(x)
 
-        x = self.processor_blocks(x)
+        x = self.processor_blocks(x, film_embed=film_embed)
 
         if self.checkpointing_level >= 1:
             x = checkpoint(self.decode, x, use_reentrant=False)

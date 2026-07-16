@@ -192,6 +192,61 @@ def test_checkpoint_roundtrip(tmp_path):
 
 
 # -----------------------------------------------------------------------------
+# FiLM stochastic conditioning (noise_mode="film")
+# -----------------------------------------------------------------------------
+
+
+def test_film_zero_init_is_identity_and_diversifies():
+    """Zero-init FiLM heads reproduce the deterministic map exactly at init
+    (warm-start safety); once the heads are non-zero, different latents give
+    different outputs."""
+    torch.manual_seed(0)
+    model = _tiny_model(noise_mode="film", film_latent_dim=8).eval()
+    x = torch.randn(2, 4, 16, 32)
+    z = torch.randn(2, 8)
+    with torch.no_grad():
+        y_none = model(x)                        # deterministic path (no latent)
+        y_zero = model(x, film_latent=z)         # zero-init heads -> identity
+    assert torch.allclose(y_none, y_zero, atol=1e-6), (
+        "zero-init FiLM must reproduce the deterministic output at init"
+    )
+
+    # Activate the FiLM heads, then check the latent actually modulates output.
+    with torch.no_grad():
+        for blk in model.blocks:
+            if blk.film0 is not None:
+                for head in (blk.film0, blk.film1):
+                    head.weight.normal_(0.0, 0.1)
+                    head.bias.normal_(0.0, 0.1)
+        y_a = model(x, film_latent=z)
+        y_b = model(x, film_latent=torch.randn(2, 8))
+    assert not torch.allclose(y_a, y_none, atol=1e-5), "active FiLM must change the output"
+    assert not torch.allclose(y_a, y_b, atol=1e-5), "different latents must differ"
+    assert torch.isfinite(y_a).all()
+
+
+def test_film_gradients_flow():
+    """Gradients reach the FiLM latent and the conditioning MLP."""
+    torch.manual_seed(0)
+    model = _tiny_model(noise_mode="film", film_latent_dim=8)
+    for blk in model.blocks:                     # break the zero-init identity
+        if blk.film0 is not None:
+            torch.nn.init.normal_(blk.film0.weight, 0.0, 0.1)
+            torch.nn.init.normal_(blk.film1.weight, 0.0, 0.1)
+    x = torch.randn(1, 4, 16, 32)
+    z = torch.randn(1, 8, requires_grad=True)
+    model(x, film_latent=z).pow(2).mean().backward()
+    assert z.grad is not None and torch.isfinite(z.grad).all() and z.grad.abs().sum() > 0
+    film_grads = [p.grad for p in model.film_embed.parameters() if p.grad is not None]
+    assert film_grads and any(g.abs().sum() > 0 for g in film_grads)
+
+
+def test_film_rejects_unknown_noise_mode():
+    with pytest.raises(NotImplementedError):
+        _tiny_model(noise_mode="concatenate")
+
+
+# -----------------------------------------------------------------------------
 # Trained-checkpoint test (real weights) - opt-in via env var
 # -----------------------------------------------------------------------------
 
