@@ -797,12 +797,10 @@ class SphericalTransformerBlock(nn.Module):
             self.film1 = None
 
     def _attn_forward(self, x: torch.Tensor) -> torch.Tensor:
-        # NeighborhoodAttentionS2's optimized CUDA kernel only supports FP32,
-        # so we disable autocast around it. AttentionS2 handles autocast natively.
-        if self.attention_mode == "neighborhood":
-            dtype = x.dtype
-            with amp.autocast(device_type=x.device.type, enabled=False):
-                return self.self_attn(x.float()).to(dtype)
+        # Both AttentionS2 and NeighborhoodAttentionS2 manage mixed precision
+        # internally: the optimized neighborhood kernel registers an AutocastCUDA
+        # dispatch that follows the active autocast dtype (and the torch fallback
+        # upcasts q/k/v to fp32), so no manual autocast guard is needed here.
         return self.self_attn(x)
 
     @staticmethod
