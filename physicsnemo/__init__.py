@@ -14,10 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import os
 
 # This is to ensure warp is quiet at startup:
 import warp as wp
+
+# Compat shim: older warp exposed ``wp.LOG_WARNING`` (and friends) as module
+# constants, but newer warp removed them in favour of standard ``logging``
+# levels. physicsnemo sets ``wp.config.log_level = wp.LOG_WARNING`` at import
+# time (below), so restore the constant on the warp module (mapped to the
+# logging level) here. This package __init__ always runs before any
+# ``physicsnemo.*`` submodule, so the shim covers all of them in one place.
+if not hasattr(wp, "LOG_WARNING"):
+    wp.LOG_WARNING = logging.WARNING
 
 from .core.meta import ModelMetaData  # noqa E402
 from .core.module import Module  # noqa E402
