@@ -19,10 +19,15 @@ import sys
 import time
 from os import getcwd, makedirs
 from os.path import abspath, exists, join
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple, Union, Optional
 
 import torch
 import torch.cuda.profiler as profiler
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:  # pragma: no cover
+    SummaryWriter = None  # type: ignore
 
 from physicsnemo.distributed import DistributedManager, reduce_loss
 
@@ -77,6 +82,7 @@ class LaunchLogger(object):
 
     mlflow_run = None
     mlflow_client = None
+    tb_writer: Optional["SummaryWriter"] = None
 
     def __new__(cls, name_space, *args, **kwargs):
         # If namespace already has an instance just return that
@@ -329,6 +335,23 @@ class LaunchLogger(object):
                     self.mlflow_run.info.run_id, key, value, step=step[1]
                 )
 
+        # TensorBoard Logging
+        if self.tensorboard_backend:
+            # Map step tuple ("iter"|"epoch", idx) to a global step; use idx directly
+            gstep = step[1] if step is not None else None
+            for key, value in metric_dict.items():
+                if value is None:
+                    continue
+                try:
+                    self.tb_writer.add_scalar(key, float(value), global_step=gstep)
+                except Exception:
+                    # Best-effort logging
+                    pass
+            try:
+                self.tb_writer.flush()
+            except Exception:
+                pass
+
         # WandB Logging
         if self.wandb_backend:
             if WANDB_AVAILABLE:
@@ -379,6 +402,10 @@ class LaunchLogger(object):
                 run_id=self.mlflow_run.info.run_id,
             )
 
+        if self.tensorboard_backend:
+            self.tb_writer.add_figure(artifact_file, figure)
+            self.tb_writer.flush()
+
         if (not self.wandb_backend) and (not self.mlflow_backend):
             log_to_file = True
 
@@ -411,6 +438,17 @@ class LaunchLogger(object):
             Use MLFlow logging
         """
         cls.mlflow_backend = value
+
+    @classmethod
+    def toggle_tensorboard(cls, value: bool):
+        """Toggle TensorBoard logging
+
+        Parameters
+        ----------
+        value : bool
+            Use TensorBoard logging
+        """
+        cls.tensorboard_backend = value
 
     @staticmethod
     def initialize(use_wandb: bool = False, use_mlflow: bool = False):
@@ -447,3 +485,8 @@ class LaunchLogger(object):
 
         if use_mlflow:
             LaunchLogger.toggle_mlflow(True)
+
+        # NOTE: TensorBoard is enabled by calling
+        # ``physicsnemo.utils.logging.tensorboard.initialize_tensorboard(...)``,
+        # which sets ``LaunchLogger.tb_writer`` and toggles the backend on its
+        # own. Don't pass tensorboard kwargs to ``initialize`` here.
