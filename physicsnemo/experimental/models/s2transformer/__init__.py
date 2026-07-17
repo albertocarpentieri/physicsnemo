@@ -15,9 +15,13 @@
 # limitations under the License.
 
 from .s2transformer import (
-    AttentionDecoder,
-    AttentionEncoder,
     MetaData,
-    PrecipAttentionNet,
+    NoiseConfig,
+    S2AttDecoder,
+    S2AttEncoder,
+    S2PosEmbedConfig,
+    S2ProcessorConfig,
+    S2ResamplingConfig,
+    S2Transformer,
     SphericalTransformerBlock,
 )

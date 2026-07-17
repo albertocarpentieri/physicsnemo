@@ -15,7 +15,7 @@
 # limitations under the License.
 """Self-contained building blocks for the spherical transformer (S2Transformer).
 
-Only the layers required by :class:`~physicsnemo.experimental.models.s2transformer.s2transformer.PrecipAttentionNet`
+Only the layers required by :class:`~physicsnemo.experimental.models.s2transformer.s2transformer.S2Transformer`
 are provided here (stochastic-depth ``DropPath`` and a channel-first ``MLP``),
 so the model has no dependency on any external ``common``/``makani`` layer
 package at import or run time.

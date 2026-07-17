@@ -15,7 +15,7 @@
 # limitations under the License.
 r"""Spherical transformer (S2Transformer) for gridded geophysical fields.
 
-This module provides :class:`PrecipAttentionNet`, a fully attention-based
+This module provides :class:`S2Transformer`, a fully attention-based
 encoder / processor / decoder backbone that operates directly on the sphere.
 Every internal mixer is a spherical transformer block built around
 torch-harmonics' :class:`~torch_harmonics.AttentionS2` /
@@ -24,10 +24,10 @@ https://arxiv.org/abs/2505.11157):
 
 .. code-block:: text
 
-    AttentionEncoder (in_channels -> embed_dim,  H_in,W_in -> h,w)
+    S2AttEncoder (in_channels -> embed_dim,  H_in,W_in -> h,w)
         + optional positional embedding on the (h, w) internal grid
         -> [SphericalTransformerBlock] x num_layers
-    AttentionDecoder (embed_dim -> out_channels, h,w -> H_out,W_out)
+    S2AttDecoder (embed_dim -> out_channels, h,w -> H_out,W_out)
         + optional big-skip residual from the input
 
 Each :class:`SphericalTransformerBlock` is the canonical pre-norm transformer:
@@ -41,8 +41,8 @@ from this module is instantiated (see :func:`physicsnemo.core.version_check`).
 """
 
 import math
-from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from dataclasses import asdict, dataclass, is_dataclass
+from typing import Any, List, Optional, Tuple, Union
 
 import torch
 import torch.amp as amp
@@ -63,7 +63,7 @@ from .layers import MLP, DropPath
 # It is optional: the imports below are lazy (``th.<Attr>`` triggers the import
 # on first access), so ``import physicsnemo`` never fails for users who do not
 # need this model. A clear, actionable error is raised at model construction
-# time when the package is missing (see ``PrecipAttentionNet.__init__``).
+# time when the package is missing (see ``S2Transformer.__init__``).
 register_package_hint(
     "torch_harmonics",
     "torch_harmonics is required for the spherical transformer (S2Transformer) "
@@ -102,7 +102,7 @@ def _neighborhood_radius_rad(nlat: int, factor: float) -> float:
 # -----------------------------------------------------------------------------
 
 
-class AttentionEncoder(nn.Module):
+class S2AttEncoder(nn.Module):
     r"""Spherical-attention encoder: ``(in_chans, H_in, W_in) -> (out_chans, h, w)``.
 
     Pipeline:
@@ -190,7 +190,7 @@ class AttentionEncoder(nn.Module):
         )
         if self._needs_resample and self.attn_dim % num_heads != 0:
             raise ValueError(
-                f"AttentionEncoder: attn_dim ({self.attn_dim}) must be divisible "
+                f"S2AttEncoder: attn_dim ({self.attn_dim}) must be divisible "
                 f"by num_heads ({num_heads})."
             )
 
@@ -275,10 +275,10 @@ class AttentionEncoder(nn.Module):
         return x
 
 
-class AttentionDecoder(nn.Module):
+class S2AttDecoder(nn.Module):
     r"""Spherical-attention decoder: ``(in_chans, h, w) -> (out_chans, H_out, W_out)``.
 
-    Mirror of :class:`AttentionEncoder`. When the latent and output grids differ,
+    Mirror of :class:`S2AttEncoder`. When the latent and output grids differ,
     the decoder upsamples with a spherically-correct bilinear
     :class:`~torch_harmonics.ResampleS2` (or an SHT round-trip when
     ``upsample_sht=True``) and adds a learned cross-resolution "attnup"
@@ -366,7 +366,7 @@ class AttentionDecoder(nn.Module):
         self.attn_dim = int(attn_dim) if attn_dim else self.in_chans
         if self._needs_resample and self.attn_dim % num_heads != 0:
             raise ValueError(
-                f"AttentionDecoder: attn_dim ({self.attn_dim}) must be divisible by "
+                f"S2AttDecoder: attn_dim ({self.attn_dim}) must be divisible by "
                 f"num_heads ({num_heads})."
             )
 
@@ -835,13 +835,13 @@ class SphericalTransformerBlock(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# PrecipAttentionNet
+# S2Transformer
 # -----------------------------------------------------------------------------
 
 
 @dataclass
 class MetaData(ModelMetaData):
-    """Metadata for :class:`PrecipAttentionNet`."""
+    """Metadata for :class:`S2Transformer`."""
 
     jit: bool = False
     cuda_graphs: bool = True
@@ -854,7 +854,82 @@ class MetaData(ModelMetaData):
     auto_grad: bool = False
 
 
-class PrecipAttentionNet(Module):
+# -----------------------------------------------------------------------------
+# Configuration groups
+# -----------------------------------------------------------------------------
+# The many S2Transformer hyper-parameters are grouped into small dataclasses so
+# the constructor stays readable. Each group can be passed as the dataclass or as
+# a plain dict (which is normalised to the dataclass); dicts are also what gets
+# stored in the checkpoint (``asdict`` on save), so ``.mdlus`` round-trips remain
+# JSON-serialisable.
+
+
+@dataclass
+class S2ProcessorConfig:
+    """Processor (latent) transformer stack: block layout + self-attention."""
+
+    embed_dim: int = 128
+    num_layers: int = 4
+    num_heads: int = 4
+    attention_mode: Union[str, List[str]] = "neighborhood"  # or a per-layer list
+    attn_theta_cutoff_factor: float = 2.0                    # neighborhood radius (lat rings)
+    attn_drop_rate: float = 0.0                              # global-attention softmax dropout
+    attn_optimized_kernel: bool = True
+    qk_norm: bool = False
+    mlp_ratio: float = 2.0
+    activation: str = "gelu"
+    normalization: str = "layer_norm"
+    use_mlp: bool = True
+    path_drop_rate: float = 0.0
+    mlp_drop_rate: float = 0.0
+
+
+@dataclass
+class S2ResamplingConfig:
+    """Encoder/decoder cross-resolution attention settings.
+
+    The encoder/decoder are activated automatically whenever the grid shape or the
+    channel count changes between the input/output grids and the processor (latent)
+    grid; these settings only tune them when active.
+    """
+
+    encoder_theta_cutoff_factor: float = 1.0
+    decoder_theta_cutoff_factor: float = 1.0
+    upsample_sht: bool = False
+
+
+@dataclass
+class S2PosEmbedConfig:
+    """Processor-grid positional embedding settings."""
+
+    kind: str = "spectral"          # "none" or "spectral"
+    max_degree: Optional[int] = None
+    drop_rate: float = 0.0
+
+
+@dataclass
+class NoiseConfig:
+    """Stochastic-conditioning (noise-injection) settings; ``mode=None`` disables it."""
+
+    mode: Optional[str] = None       # None or "film"
+    latent_dim: int = 64
+    hidden: int = 0                  # 0 -> max(64, embed_dim)
+
+
+def _as_cfg(value: Union[Any, dict, None], cls: type):
+    """Normalise a config group to its dataclass (accepts dataclass / dict / None)."""
+    if value is None:
+        return cls()
+    if isinstance(value, cls):
+        return value
+    if is_dataclass(value):
+        return value
+    if isinstance(value, dict):
+        return cls(**value)
+    raise TypeError(f"Expected {cls.__name__}, dict, or None; got {type(value)!r}.")
+
+
+class S2Transformer(Module):
     r"""Fully attention-based spherical transformer (S2Transformer) backbone.
 
     An encoder / processor / decoder network for gridded geophysical fields
@@ -864,15 +939,19 @@ class PrecipAttentionNet(Module):
     latent longitude ``w`` MUST divide the input longitude (a hard constraint of
     the spherical-attention p-shift); latitude ``h`` is free.
 
-    ``use_encoder=False`` / ``use_decoder=False`` skip the spherical-attention
-    encoder / decoder (no spatial up/downsampling), so the processor grid must
-    equal the input grid (``scale_factor=1`` or ``latent_shape=inp_shape``). In
-    that case the first block's input channel count is ``in_channels`` (instead
-    of ``embed_dim``) and/or the last block's output channel count is
-    ``out_channels``; the channel change happens inside the block's MLP, and the
-    MLP residual is disabled when ``in_chans != out_chans``. Because spherical
-    attention requires ``num_heads | in_channels``, ``use_encoder=False``
-    constrains ``num_heads`` to divide ``in_channels``.
+    The spherical-attention encoder / decoder are activated automatically only
+    when the grid shape or the channel count changes between the input/output
+    grids and the processor grid. When the input grid already equals the processor
+    grid (``scale_factor=1`` or ``latent_shape=inp_shape``) and
+    ``in_channels == embed_dim`` (and likewise ``embed_dim == out_channels`` for
+    the output side), the encoder/decoder collapse to ``nn.Identity()`` and the
+    processor runs directly on the input at full resolution. Note that whenever
+    the encoder is active, spherical attention requires ``num_heads | in_channels``.
+
+    Hyper-parameters are grouped into small dataclasses (:class:`S2ProcessorConfig`,
+    :class:`S2ResamplingConfig`, :class:`S2PosEmbedConfig`, :class:`NoiseConfig`).
+    Each group may be passed as its dataclass or as a plain dict (normalised
+    internally); ``None`` uses the group's defaults.
 
     Parameters
     ----------
@@ -894,91 +973,50 @@ class PrecipAttentionNet(Module):
     latent_shape : tuple of int, optional, default=None
         Explicit processor grid shape :math:`(h, w)` (takes precedence over
         ``scale_factor``).
-    upsample_sht : bool, optional, default=False
-        Whether the decoder upsamples with an SHT round-trip.
     channel_names : list of str, optional, default=None
         Optional channel names (metadata only).
-    n_history : int, optional, default=0
-        Number of history steps. Only ``0`` is currently supported.
-    embed_dim : int, optional, default=128
-        Processor (latent) channel width. Must be divisible by ``num_heads``.
-    num_layers : int, optional, default=4
-        Number of processor :class:`SphericalTransformerBlock` layers.
-    num_heads : int, optional, default=4
-        Number of attention heads.
-    attention_mode : str or list of str, optional, default="neighborhood"
-        ``"neighborhood"``, ``"global"``, or a per-layer list of length
-        ``num_layers``.
-    attn_theta_cutoff_factor : float, optional, default=2.0
-        Processor neighborhood radius in units of latitude rings.
-    attn_drop_rate : float, optional, default=0.0
-        Dropout applied inside the global-attention softmax.
-    attn_optimized_kernel : bool, optional, default=True
-        Whether to use the optimized CUDA neighborhood-attention kernel.
-    qk_norm : bool, optional, default=False
-        Whether to apply RMSNorm to the query/key projections.
-    mlp_ratio : float, optional, default=2.0
-        Ratio of the MLP hidden dimension to the block input width.
-    activation_function : str, optional, default="gelu"
-        One of ``"relu"``, ``"gelu"``, ``"silu"``.
-    pos_drop_rate : float, optional, default=0.0
-        Dropout applied to the positional embedding.
-    path_drop_rate : float, optional, default=0.0
-        Maximum stochastic-depth rate (linearly ramped across layers).
-    mlp_drop_rate : float, optional, default=0.0
-        Dropout rate inside the MLP sublayers.
-    pos_embed : str, optional, default="spectral"
-        One of ``"none"`` or ``"spectral"`` (a fixed, non-learnable
-        spherical-harmonic embedding).
-    pos_embed_max_degree : int, optional, default=None
-        Maximum spherical-harmonic degree for the ``"spectral"`` embedding
-        (higher = finer positional resolution). ``None`` uses the low-degree
-        default enumeration.
-    normalization_layer : str, optional, default="layer_norm"
-        One of ``"none"``, ``"layer_norm"``, ``"instance_norm"``.
-    encoder_theta_cutoff_factor : float, optional, default=1.0
-        Encoder neighborhood radius in units of latitude rings (input grid).
-    decoder_theta_cutoff_factor : float, optional, default=1.0
-        Decoder neighborhood radius in units of latitude rings (output grid).
-    use_encoder : bool, optional, default=True
-        Whether to include the spherical-attention encoder.
-    use_decoder : bool, optional, default=True
-        Whether to include the spherical-attention decoder.
     big_skip : bool, optional, default=False
         Whether to add a learned 1x1 residual from the input to the output.
     bias : bool, optional, default=True
         Whether the linear projections use a bias.
-    use_mlp : bool, optional, default=True
-        Whether the processor blocks include the MLP sublayer.
     checkpointing_level : int, optional, default=0
         Activation-checkpointing aggressiveness.
-    noise_mode : str, optional, default=None
-        Stochastic conditioning mode. ``None`` disables it (purely deterministic).
-        ``"film"`` enables FiLM conditioning: a per-sample latent modulates every
-        processor block's pre-norm streams via zero-init (scale, shift) heads, so
-        a deterministic checkpoint warm-starts exactly and gains diversity only
-        once trained. Pass the latent to ``forward(..., film_latent=z)``.
-    noise_channels : int, optional, default=1
-        Reserved for API parity.
-    film_latent_dim : int, optional, default=64
-        Dimension of the per-sample FiLM latent (used only when ``noise_mode='film'``).
-    film_hidden : int, optional, default=0
-        Hidden/embedding width of the FiLM conditioning MLP. ``0`` uses
-        ``max(64, embed_dim)``.
+    processor : S2ProcessorConfig or dict, optional
+        Processor stack + self-attention settings (``embed_dim``, ``num_layers``,
+        ``num_heads``, ``attention_mode``, ``attn_theta_cutoff_factor``,
+        ``attn_drop_rate``, ``attn_optimized_kernel``, ``qk_norm``, ``mlp_ratio``,
+        ``activation``, ``normalization``, ``use_mlp``, ``path_drop_rate``,
+        ``mlp_drop_rate``). ``embed_dim`` must be divisible by ``num_heads``, and
+        ``attention_mode`` may be ``"neighborhood"``, ``"global"``, or a per-layer
+        list.
+    resampling : S2ResamplingConfig or dict, optional
+        Encoder/decoder tuning (``encoder_theta_cutoff_factor``,
+        ``decoder_theta_cutoff_factor``, ``upsample_sht``). The encoder/decoder
+        are activated automatically when the grid shape or channel count differs
+        between the input/output grids and the processor grid.
+    pos_embed : S2PosEmbedConfig or dict, optional
+        Positional-embedding settings (``kind`` in ``{"none", "spectral"}``,
+        ``max_degree``, ``drop_rate``).
+    noise : NoiseConfig or dict, optional
+        Stochastic-conditioning settings (``mode`` in ``{None, "film"}``,
+        ``latent_dim``, ``hidden``). ``mode="film"`` modulates each block's
+        pre-norm streams via zero-init (scale, shift) heads, so a deterministic
+        checkpoint warm-starts exactly; pass the latent to
+        ``forward(..., film_latent=z)``.
 
     Example
     -------
     >>> import torch
-    >>> from physicsnemo.experimental.models.s2transformer import PrecipAttentionNet
-    >>> model = PrecipAttentionNet(  # doctest: +SKIP
+    >>> from physicsnemo.experimental.models.s2transformer import (
+    ...     S2Transformer, S2ProcessorConfig,
+    ... )
+    >>> model = S2Transformer(  # doctest: +SKIP
     ...     inp_shape=(32, 64),
     ...     out_shape=(32, 64),
     ...     in_channels=4,
     ...     out_channels=1,
     ...     latent_shape=(16, 32),
-    ...     embed_dim=16,
-    ...     num_layers=2,
-    ...     num_heads=4,
+    ...     processor=S2ProcessorConfig(embed_dim=16, num_layers=2, num_heads=4),
     ... )
     >>> model(torch.randn(1, 4, 32, 64)).shape  # doctest: +SKIP
     torch.Size([1, 1, 32, 64])
@@ -994,77 +1032,58 @@ class PrecipAttentionNet(Module):
         out_channels: int = 1,
         scale_factor: int = 8,
         latent_shape: Optional[Tuple[int, int]] = None,
-        upsample_sht: bool = False,
         channel_names: Optional[List[str]] = None,
-        n_history: int = 0,
-        embed_dim: int = 128,
-        num_layers: int = 4,
-        num_heads: int = 4,
-        attention_mode="neighborhood",
-        attn_theta_cutoff_factor: float = 2.0,
-        attn_drop_rate: float = 0.0,
-        attn_optimized_kernel: bool = True,
-        qk_norm: bool = False,
-        mlp_ratio: float = 2.0,
-        activation_function: str = "gelu",
-        pos_drop_rate: float = 0.0,
-        path_drop_rate: float = 0.0,
-        mlp_drop_rate: float = 0.0,
-        pos_embed: str = "spectral",
-        pos_embed_max_degree: Optional[int] = None,
-        normalization_layer: str = "layer_norm",
-        encoder_theta_cutoff_factor: float = 1.0,
-        decoder_theta_cutoff_factor: float = 1.0,
-        use_encoder: bool = True,
-        use_decoder: bool = True,
         big_skip: bool = False,
         bias: bool = True,
-        use_mlp: bool = True,
         checkpointing_level: int = 0,
-        noise_mode: Optional[str] = None,
-        noise_channels: int = 1,
-        film_latent_dim: int = 64,
-        film_hidden: int = 0,
+        processor: Union[S2ProcessorConfig, dict, None] = None,
+        resampling: Union[S2ResamplingConfig, dict, None] = None,
+        pos_embed: Union[S2PosEmbedConfig, dict, None] = None,
+        noise: Union[NoiseConfig, dict, None] = None,
         **kwargs,
     ):
         super().__init__(meta=MetaData())
 
         if not TORCH_HARMONICS_AVAILABLE:
             raise ImportError(
-                "PrecipAttentionNet requires the optional dependency "
+                "S2Transformer requires the optional dependency "
                 "'torch_harmonics' (>=0.7.0), which is not installed.\n"
                 "Install with:\n  pip install torch_harmonics>=0.7.0\n"
                 "  pip install nvidia-physicsnemo[harmonics]"
             )
-        if n_history != 0:
-            raise ValueError("PrecipAttentionNet currently only supports n_history=0.")
-        if noise_mode not in (None, "film"):
+
+        # Grouped hyper-parameters (accept dataclass / dict / None).
+        self.processor = _as_cfg(processor, S2ProcessorConfig)
+        self.resampling = _as_cfg(resampling, S2ResamplingConfig)
+        self.pos_embed_cfg = _as_cfg(pos_embed, S2PosEmbedConfig)
+        self.noise = _as_cfg(noise, NoiseConfig)
+
+        if self.noise.mode not in (None, "film"):
             raise NotImplementedError(
-                f"PrecipAttentionNet supports noise_mode in (None, 'film'); "
-                f"got {noise_mode!r}."
+                f"S2Transformer supports noise.mode in (None, 'film'); "
+                f"got {self.noise.mode!r}."
             )
 
+        # Convenience scalar attributes used throughout the model / forward.
         self.inp_shape = tuple(inp_shape)
         self.out_shape = tuple(out_shape)
         self.in_channels = int(in_channels)
         self.out_channels = int(out_channels)
-        self.embed_dim = int(embed_dim)
-        self.num_layers = int(num_layers)
-        self.use_encoder = bool(use_encoder)
-        self.use_decoder = bool(use_decoder)
+        self.embed_dim = int(self.processor.embed_dim)
+        self.num_layers = int(self.processor.num_layers)
         self.big_skip = bool(big_skip)
         self.checkpointing_level = int(checkpointing_level)
+        self.noise_mode = self.noise.mode
 
         # FiLM ("film") stochastic conditioning: a per-sample latent vector is
         # turned into a shared embedding that every processor block's zero-init
         # FiLM head maps to per-channel (scale, shift). It does NOT change the
-        # input channel count, so a deterministic (noise_mode=None) checkpoint
-        # warm-starts exactly. noise_mode=None disables it entirely.
-        self.noise_mode = noise_mode
-        self.film_latent_dim = int(film_latent_dim) if noise_mode == "film" else 0
+        # input channel count, so a deterministic (noise.mode=None) checkpoint
+        # warm-starts exactly. noise.mode=None disables it entirely.
+        self.film_latent_dim = int(self.noise.latent_dim) if self.noise.mode == "film" else 0
         self._film_dim = 0
-        if self.noise_mode == "film":
-            self._film_dim = int(film_hidden) if film_hidden else max(64, self.embed_dim)
+        if self.noise.mode == "film":
+            self._film_dim = int(self.noise.hidden) if self.noise.hidden else max(64, self.embed_dim)
             self.film_embed = nn.Sequential(
                 nn.Linear(self.film_latent_dim, self._film_dim),
                 nn.SiLU(),
@@ -1074,14 +1093,10 @@ class PrecipAttentionNet(Module):
         else:
             self.film_embed = None
 
-        if activation_function == "relu":
-            act_layer = nn.ReLU
-        elif activation_function == "gelu":
-            act_layer = nn.GELU
-        elif activation_function == "silu":
-            act_layer = nn.SiLU
-        else:
-            raise ValueError(f"Unknown activation function {activation_function}")
+        _acts = {"relu": nn.ReLU, "gelu": nn.GELU, "silu": nn.SiLU}
+        if self.processor.activation not in _acts:
+            raise ValueError(f"Unknown activation function {self.processor.activation}")
+        act_layer = _acts[self.processor.activation]
 
         # Internal (processor) spatial shape. Two ways to specify it:
         #   1. latent_shape=(h, w) - explicit, takes precedence.
@@ -1095,12 +1110,24 @@ class PrecipAttentionNet(Module):
         else:
             self.h = int(self.inp_shape[0] // scale_factor)
             self.w = int(self.inp_shape[1] // scale_factor)
+
+        # The encoder/decoder are needed only when the grid shape OR the channel
+        # count changes between the input/output grids and the processor (latent)
+        # grid. When both match, they collapse to nn.Identity() and the processor
+        # runs directly on the input.
+        self.use_encoder = (tuple(self.inp_shape) != (self.h, self.w)) or (
+            self.in_channels != self.embed_dim
+        )
+        self.use_decoder = (tuple(self.out_shape) != (self.h, self.w)) or (
+            self.embed_dim != self.out_channels
+        )
         if self.use_encoder and self.inp_shape[1] % self.w != 0:
             raise ValueError(
-                f"PrecipAttentionNet: latent longitude w={self.w} must divide "
+                f"S2Transformer: latent longitude w={self.w} must divide "
                 f"input longitude W={self.inp_shape[1]} (spherical-attention "
                 f"p-shift). Pick a w that divides {self.inp_shape[1]}."
             )
+        proc = self.processor  # local alias for readability
 
         # Encoder/decoder: when off they are pure nn.Identity() and the channel
         # routing in_channels -> embed_dim -> out_channels is pushed into the
@@ -1109,66 +1136,52 @@ class PrecipAttentionNet(Module):
         # use_encoder=False / use_decoder=False require the processor grid to
         # equal the input grid.
         if self.use_encoder:
-            self.encoder = AttentionEncoder(
+            self.encoder = S2AttEncoder(
                 inp_shape=self.inp_shape,
                 out_shape=(self.h, self.w),
                 in_chans=self.in_channels,
                 out_chans=self.embed_dim,
                 grid_in=model_grid_type,
                 grid_out=sht_grid_type,
-                num_heads=int(num_heads),
-                theta_cutoff_factor=encoder_theta_cutoff_factor,
-                qk_norm=qk_norm,
+                num_heads=int(proc.num_heads),
+                theta_cutoff_factor=self.resampling.encoder_theta_cutoff_factor,
+                qk_norm=proc.qk_norm,
                 bias=bias,
-                attn_optimized_kernel=attn_optimized_kernel,
+                attn_optimized_kernel=proc.attn_optimized_kernel,
             )
         else:
-            if (self.h, self.w) != tuple(self.inp_shape):
-                raise ValueError(
-                    "use_encoder=False with PrecipAttentionNet requires the "
-                    "processor grid to match the input grid (set scale_factor=1). "
-                    f"Got inp_shape={self.inp_shape} but processor grid is "
-                    f"({self.h}, {self.w})."
-                )
             self.encoder = nn.Identity()
 
         if self.use_decoder:
-            self.decoder = AttentionDecoder(
+            self.decoder = S2AttDecoder(
                 inp_shape=(self.h, self.w),
                 out_shape=self.out_shape,
                 in_chans=self.embed_dim,
                 out_chans=self.out_channels,
                 grid_in=sht_grid_type,
                 grid_out=model_grid_type,
-                num_heads=int(num_heads),
-                theta_cutoff_factor=decoder_theta_cutoff_factor,
-                qk_norm=qk_norm,
+                num_heads=int(proc.num_heads),
+                theta_cutoff_factor=self.resampling.decoder_theta_cutoff_factor,
+                qk_norm=proc.qk_norm,
                 bias=bias,
-                attn_optimized_kernel=attn_optimized_kernel,
-                upsample_sht=upsample_sht,
+                attn_optimized_kernel=proc.attn_optimized_kernel,
+                upsample_sht=self.resampling.upsample_sht,
             )
         else:
-            if (self.h, self.w) != tuple(self.out_shape):
-                raise ValueError(
-                    "use_decoder=False with PrecipAttentionNet requires the "
-                    "processor grid to match the output grid (set scale_factor=1). "
-                    f"Got out_shape={self.out_shape} but processor grid is "
-                    f"({self.h}, {self.w})."
-                )
             self.decoder = nn.Identity()
 
         # Resolve per-block attention modes (allow list-of-strings for mix-and-match).
-        if isinstance(attention_mode, str):
-            modes = [attention_mode] * self.num_layers
+        if isinstance(proc.attention_mode, str):
+            modes = [proc.attention_mode] * self.num_layers
         else:
-            modes = list(attention_mode)
+            modes = list(proc.attention_mode)
             if len(modes) != self.num_layers:
                 raise ValueError(
-                    f"attention_mode list length ({len(modes)}) must equal "
-                    f"num_layers ({self.num_layers})."
+                    f"processor.attention_mode list length ({len(modes)}) must "
+                    f"equal num_layers ({self.num_layers})."
                 )
 
-        attn_theta_cutoff = _neighborhood_radius_rad(self.h, attn_theta_cutoff_factor)
+        attn_theta_cutoff = _neighborhood_radius_rad(self.h, proc.attn_theta_cutoff_factor)
 
         # Per-block channel routing:
         #   first block:  in_ch = in_channels   if use_encoder=False else embed_dim
@@ -1188,17 +1201,19 @@ class PrecipAttentionNet(Module):
         # The positional embedding lives just before the first processor block,
         # so it has to match that block's input channel count.
         first_in_ch = _block_in_ch(0)
-        self.pos_drop = nn.Dropout(p=pos_drop_rate) if pos_drop_rate > 0.0 else nn.Identity()
+        pdrop = self.pos_embed_cfg.drop_rate
+        self.pos_drop = nn.Dropout(p=pdrop) if pdrop > 0.0 else nn.Identity()
         self.pos_embed = _build_pos_embedding(
-            pos_embed,
+            self.pos_embed_cfg.kind,
             (self.h, self.w),
             first_in_ch,
             sht_grid_type,
-            max_degree=pos_embed_max_degree,
+            max_degree=self.pos_embed_cfg.max_degree,
         )
 
         dpr = [
-            float(x) for x in torch.linspace(0, path_drop_rate, max(1, self.num_layers))
+            float(x)
+            for x in torch.linspace(0, proc.path_drop_rate, max(1, self.num_layers))
         ]
         self.blocks = nn.ModuleList(
             [
@@ -1207,19 +1222,19 @@ class PrecipAttentionNet(Module):
                     grid=sht_grid_type,
                     in_chans=_block_in_ch(i),
                     out_chans=_block_out_ch(i),
-                    num_heads=int(num_heads),
+                    num_heads=int(proc.num_heads),
                     attention_mode=modes[i],
                     attn_theta_cutoff=attn_theta_cutoff,
-                    mlp_ratio=mlp_ratio,
-                    mlp_drop_rate=mlp_drop_rate,
-                    attn_drop_rate=attn_drop_rate,
+                    mlp_ratio=proc.mlp_ratio,
+                    mlp_drop_rate=proc.mlp_drop_rate,
+                    attn_drop_rate=proc.attn_drop_rate,
                     path_drop_rate=dpr[i],
                     act_layer=act_layer,
-                    normalization_layer=normalization_layer,
+                    normalization_layer=proc.normalization,
                     bias=bias,
-                    use_mlp=use_mlp,
-                    qk_norm=qk_norm,
-                    attn_optimized_kernel=attn_optimized_kernel,
+                    use_mlp=proc.use_mlp,
+                    qk_norm=proc.qk_norm,
+                    attn_optimized_kernel=proc.attn_optimized_kernel,
                     checkpointing_level=self.checkpointing_level,
                     film_dim=self._film_dim,
                 )
@@ -1233,6 +1248,17 @@ class PrecipAttentionNet(Module):
             )
             scale = math.sqrt(0.5 / max(1, self.in_channels))
             nn.init.normal_(self.residual_transform.weight, mean=0.0, std=scale)
+
+        # Store JSON-serialisable (dict) forms of the config groups so that
+        # Module.save() (which json-dumps __args__) round-trips; from_checkpoint
+        # passes them back as dicts, which __init__ normalises to dataclasses.
+        for _name, _cfg in (
+            ("processor", self.processor),
+            ("resampling", self.resampling),
+            ("pos_embed", self.pos_embed_cfg),
+            ("noise", self.noise),
+        ):
+            self._args["__args__"][_name] = asdict(_cfg)
 
     # ------------------------------------------------------------------
     # Forward
@@ -1284,7 +1310,7 @@ class PrecipAttentionNet(Module):
         """
         if noise is not None:
             raise NotImplementedError(
-                "PrecipAttentionNet does not (yet) support noise conditioning."
+                "S2Transformer does not (yet) support noise conditioning."
             )
         film_embed = None
         if self.noise_mode == "film" and film_latent is not None:
