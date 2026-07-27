@@ -104,6 +104,95 @@ def test_encoder_decoder_auto_activation():
     assert m2.use_encoder and m2.use_decoder
 
 
+class _RecordQKV(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q = None
+        self.k = None
+        self.v = None
+
+    def forward(self, query, key=None, value=None):
+        self.q = query.detach().clone()
+        self.k = key.detach().clone()
+        self.v = value.detach().clone()
+        return torch.zeros_like(value)
+
+
+def test_qk_positional_embedding_is_applied_in_every_attention_only():
+    model = _tiny_model(
+        pos_embed=S2PosEmbedConfig(kind="spectral", application="qk")
+    ).eval()
+    recorders = []
+    for block in model.blocks:
+        recorder = _RecordQKV()
+        block.self_attn = recorder
+        recorders.append(recorder)
+
+    x = torch.randn(1, 8, 16, 32)
+    with torch.no_grad():
+        model(x)
+
+    expected_pe = model.pos_embed.position_embeddings
+    for recorder in recorders:
+        assert recorder.q is not None
+        assert torch.equal(recorder.q, recorder.k)
+        assert torch.allclose(recorder.q - recorder.v, expected_pe)
+
+
+def test_grid_type_defaults_preserve_legacy_behavior():
+    torch.manual_seed(0)
+    legacy = _tiny_model().eval()
+    torch.manual_seed(0)
+    explicit = _tiny_model(
+        inp_grid_type="equiangular",
+        out_grid_type="equiangular",
+    ).eval()
+
+    assert legacy.inp_grid_type == legacy.model_grid_type == "equiangular"
+    assert legacy.out_grid_type == legacy.model_grid_type == "equiangular"
+    assert legacy.state_dict().keys() == explicit.state_dict().keys()
+    for legacy_value, explicit_value in zip(
+        legacy.state_dict().values(), explicit.state_dict().values()
+    ):
+        assert torch.equal(legacy_value, explicit_value)
+
+    x = torch.randn(1, 8, 16, 32)
+    with torch.no_grad():
+        assert torch.equal(legacy(x), explicit(x))
+
+
+def test_legendre_gauss_input_to_equiangular_output():
+    """Small analogue of a 360x720 LG input decoded to 361x720 equiangular."""
+    model = _tiny_model(
+        inp_grid_type="legendre-gauss",
+        out_grid_type="equiangular",
+        sht_grid_type="legendre-gauss",
+        inp_shape=(8, 16),
+        out_shape=(9, 16),
+        latent_shape=(4, 8),
+        in_channels=4,
+        out_channels=2,
+        processor=S2ProcessorConfig(
+            embed_dim=4,
+            num_layers=1,
+            num_heads=1,
+            attention_mode="global",
+            attn_optimized_kernel=False,
+            normalization="layer_norm",
+        ),
+        pos_embed=S2PosEmbedConfig(kind="none"),
+    ).eval()
+
+    x = torch.randn(1, 4, 8, 16)
+    with torch.no_grad():
+        y = model(x)
+
+    assert model.inp_grid_type == "legendre-gauss"
+    assert model.out_grid_type == "equiangular"
+    assert y.shape == (1, 2, 9, 16)
+    assert torch.isfinite(y).all()
+
+
 def test_checkpoint_roundtrip(tmp_path):
     torch.manual_seed(0)
     model = _tiny_model().eval()
@@ -118,6 +207,41 @@ def test_checkpoint_roundtrip(tmp_path):
         y_new = reloaded(x)
 
     assert torch.allclose(y_ref, y_new, atol=1e-6, rtol=0)
+
+
+def test_asymmetric_grid_types_checkpoint_roundtrip(tmp_path):
+    model = _tiny_model(
+        inp_grid_type="legendre-gauss",
+        out_grid_type="equiangular",
+    )
+    assert model._args["__args__"]["inp_grid_type"] == "legendre-gauss"
+    assert model._args["__args__"]["out_grid_type"] == "equiangular"
+
+    ckpt = tmp_path / "s2transformer_asymmetric.mdlus"
+    model.save(str(ckpt))
+    reloaded = S2Transformer.from_checkpoint(str(ckpt))
+
+    assert reloaded.inp_grid_type == "legendre-gauss"
+    assert reloaded.out_grid_type == "equiangular"
+    assert reloaded.state_dict().keys() == model.state_dict().keys()
+    for original, restored in zip(
+        model.state_dict().values(), reloaded.state_dict().values()
+    ):
+        assert torch.equal(original, restored)
+
+
+def test_qk_positional_embedding_checkpoint_roundtrip(tmp_path):
+    model = _tiny_model(
+        pos_embed=S2PosEmbedConfig(kind="spectral", application="qk")
+    )
+    assert model._args["__args__"]["pos_embed"]["application"] == "qk"
+
+    ckpt = tmp_path / "s2transformer_qk_pos_embed.mdlus"
+    model.save(str(ckpt))
+    reloaded = S2Transformer.from_checkpoint(str(ckpt))
+
+    assert reloaded.pos_embed_application == "qk"
+    assert hasattr(reloaded.pos_embed, "position_embeddings")
 
 
 # -----------------------------------------------------------------------------

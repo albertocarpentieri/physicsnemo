@@ -796,12 +796,23 @@ class SphericalTransformerBlock(nn.Module):
             self.film0 = None
             self.film1 = None
 
-    def _attn_forward(self, x: torch.Tensor) -> torch.Tensor:
+    def _attn_forward(
+        self,
+        x: torch.Tensor,
+        qk_pos_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         # Both AttentionS2 and NeighborhoodAttentionS2 manage mixed precision
         # internally: the optimized neighborhood kernel registers an AutocastCUDA
         # dispatch that follows the active autocast dtype (and the torch fallback
         # upcasts q/k/v to fp32), so no manual autocast guard is needed here.
-        return self.self_attn(x)
+        if qk_pos_embed is None:
+            return self.self_attn(x)
+
+        # Position enters each layer through Q/K only. Values and the residual
+        # stream remain pure content. The attention module applies its learned
+        # Q/K/V projections and optional QK normalization afterward.
+        qk = x + qk_pos_embed.to(device=x.device, dtype=x.dtype)
+        return self.self_attn(qk, qk, x)
 
     @staticmethod
     def _apply_film(h: torch.Tensor, head: nn.Module, film_embed: torch.Tensor) -> torch.Tensor:
@@ -810,7 +821,12 @@ class SphericalTransformerBlock(nn.Module):
         beta = beta.unsqueeze(-1).unsqueeze(-1).to(h.dtype)
         return h * (1.0 + gamma) + beta
 
-    def forward(self, x: torch.Tensor, film_embed: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        film_embed: Optional[torch.Tensor] = None,
+        qk_pos_embed: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Apply the pre-norm attention + MLP block to ``x`` of shape :math:`(B, C, h, w)`.
 
         If ``film_embed`` is provided and FiLM heads exist, each pre-norm stream is
@@ -820,7 +836,7 @@ class SphericalTransformerBlock(nn.Module):
         h = self.norm0(x)
         if self.film0 is not None and film_embed is not None:
             h = self._apply_film(h, self.film0, film_embed)
-        h = self._attn_forward(h)
+        h = self._attn_forward(h, qk_pos_embed)
         x = residual + self.drop_path0(h)
 
         if self.mlp is not None:
@@ -903,6 +919,7 @@ class S2PosEmbedConfig:
     """Processor-grid positional embedding settings."""
 
     kind: str = "spectral"          # "none" or "spectral"
+    application: str = "input"      # "input" (legacy) or per-block "qk"
     max_degree: Optional[int] = None
     drop_rate: float = 0.0
 
@@ -956,7 +973,9 @@ class S2Transformer(Module):
     Parameters
     ----------
     model_grid_type : str, optional, default="equiangular"
-        Quadrature grid type of the input/output grids.
+        Backward-compatible quadrature grid type of the input/output grids.
+        Used for either side when ``inp_grid_type`` or ``out_grid_type`` is
+        omitted.
     sht_grid_type : str, optional, default="legendre-gauss"
         Quadrature grid type of the internal (processor) grid.
     inp_shape : tuple of int, optional, default=(721, 1440)
@@ -1003,6 +1022,12 @@ class S2Transformer(Module):
         pre-norm streams via zero-init (scale, shift) heads, so a deterministic
         checkpoint warm-starts exactly; pass the latent to
         ``forward(..., film_latent=z)``.
+    inp_grid_type : str, optional, default=None
+        Quadrature grid type of the input grid. ``None`` preserves legacy
+        behavior by using ``model_grid_type``.
+    out_grid_type : str, optional, default=None
+        Quadrature grid type of the output grid. ``None`` preserves legacy
+        behavior by using ``model_grid_type``.
 
     Example
     -------
@@ -1040,6 +1065,8 @@ class S2Transformer(Module):
         resampling: Union[S2ResamplingConfig, dict, None] = None,
         pos_embed: Union[S2PosEmbedConfig, dict, None] = None,
         noise: Union[NoiseConfig, dict, None] = None,
+        inp_grid_type: Optional[str] = None,
+        out_grid_type: Optional[str] = None,
         **kwargs,
     ):
         super().__init__(meta=MetaData())
@@ -1058,6 +1085,18 @@ class S2Transformer(Module):
         self.pos_embed_cfg = _as_cfg(pos_embed, S2PosEmbedConfig)
         self.noise = _as_cfg(noise, NoiseConfig)
 
+        self.pos_embed_application = self.pos_embed_cfg.application.lower()
+        if self.pos_embed_application not in {"input", "qk"}:
+            raise ValueError(
+                "pos_embed.application must be 'input' or 'qk'; "
+                f"got {self.pos_embed_cfg.application!r}."
+            )
+        if (
+            self.pos_embed_application == "qk"
+            and self.pos_embed_cfg.drop_rate != 0.0
+        ):
+            raise ValueError("Q/K positional embedding does not support dropout.")
+
         if self.noise.mode not in (None, "film"):
             raise NotImplementedError(
                 f"S2Transformer supports noise.mode in (None, 'film'); "
@@ -1074,6 +1113,14 @@ class S2Transformer(Module):
         self.big_skip = bool(big_skip)
         self.checkpointing_level = int(checkpointing_level)
         self.noise_mode = self.noise.mode
+        # Keep model_grid_type as the single legacy default while allowing the
+        # encoder and decoder boundary grids to differ. These arguments are
+        # explicit in the signature so PhysicsNeMo's Module constructor capture
+        # serializes them into checkpoints.
+        self.model_grid_type = model_grid_type
+        self.sht_grid_type = sht_grid_type
+        self.inp_grid_type = model_grid_type if inp_grid_type is None else inp_grid_type
+        self.out_grid_type = model_grid_type if out_grid_type is None else out_grid_type
 
         # FiLM ("film") stochastic conditioning: a per-sample latent vector is
         # turned into a shared embedding that every processor block's zero-init
@@ -1141,8 +1188,8 @@ class S2Transformer(Module):
                 out_shape=(self.h, self.w),
                 in_chans=self.in_channels,
                 out_chans=self.embed_dim,
-                grid_in=model_grid_type,
-                grid_out=sht_grid_type,
+                grid_in=self.inp_grid_type,
+                grid_out=self.sht_grid_type,
                 num_heads=int(proc.num_heads),
                 theta_cutoff_factor=self.resampling.encoder_theta_cutoff_factor,
                 qk_norm=proc.qk_norm,
@@ -1158,8 +1205,8 @@ class S2Transformer(Module):
                 out_shape=self.out_shape,
                 in_chans=self.embed_dim,
                 out_chans=self.out_channels,
-                grid_in=sht_grid_type,
-                grid_out=model_grid_type,
+                grid_in=self.sht_grid_type,
+                grid_out=self.out_grid_type,
                 num_heads=int(proc.num_heads),
                 theta_cutoff_factor=self.resampling.decoder_theta_cutoff_factor,
                 qk_norm=proc.qk_norm,
@@ -1198,9 +1245,13 @@ class S2Transformer(Module):
                 return self.out_channels
             return self.embed_dim
 
-        # The positional embedding lives just before the first processor block,
-        # so it has to match that block's input channel count.
+        # Legacy "input" PE is added once before the processor stack. "qk" PE
+        # is instead reused by every block immediately before attention.
         first_in_ch = _block_in_ch(0)
+        if self.pos_embed_application == "qk" and any(
+            _block_in_ch(i) != first_in_ch for i in range(self.num_layers)
+        ):
+            raise ValueError("Q/K positional embedding requires one processor width.")
         pdrop = self.pos_embed_cfg.drop_rate
         self.pos_drop = nn.Dropout(p=pdrop) if pdrop > 0.0 else nn.Identity()
         self.pos_embed = _build_pos_embedding(
@@ -1276,12 +1327,28 @@ class S2Transformer(Module):
         self, x: torch.Tensor, film_embed: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """Apply positional embedding and the stack of processor blocks."""
-        x = self.pos_embed(self.pos_drop(x))
+        if self.pos_embed_application == "input":
+            x = self.pos_embed(self.pos_drop(x))
+        qk_pos_embed = (
+            getattr(self.pos_embed, "position_embeddings", None)
+            if self.pos_embed_application == "qk"
+            else None
+        )
         for blk in self.blocks:
             if self.checkpointing_level >= 3:
-                x = checkpoint(blk, x, film_embed, use_reentrant=False)
+                x = checkpoint(
+                    blk,
+                    x,
+                    film_embed,
+                    qk_pos_embed,
+                    use_reentrant=False,
+                )
             else:
-                x = blk(x, film_embed=film_embed)
+                x = blk(
+                    x,
+                    film_embed=film_embed,
+                    qk_pos_embed=qk_pos_embed,
+                )
         return x
 
     def forward(
