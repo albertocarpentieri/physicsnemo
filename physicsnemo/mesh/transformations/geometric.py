@@ -14,16 +14,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Geometric transformations for simplicial meshes.
+"""Linear and affine transformations for simplicial meshes.
 
-This module implements linear and affine transformations with intelligent
-cache handling. By default, all caches are invalidated; transformations
-explicitly opt-in to preserve/transform specific cache fields.
+This module implements geometric point transformations with intelligent cache
+handling. By default, all caches are invalidated; transformations explicitly
+opt in to preserve or update valid cache fields.
 
 Cached fields handled:
 - areas: point_data and cell_data
 - normals: point_data and cell_data
 - centroids: cell_data only
+
 """
 
 from collections.abc import Sequence
@@ -285,7 +286,7 @@ def rotation_matrix(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Float[torch.Tensor, "n_spatial_dims n_spatial_dims"]:
-    r"""Build a rotation matrix from angle and axis.
+    """Build a rotation matrix from angle and axis.
 
     Parameters
     ----------
@@ -317,7 +318,7 @@ def scale_matrix(
     device: torch.device,
     dtype: torch.dtype,
 ) -> Float[torch.Tensor, "n_spatial_dims n_spatial_dims"]:
-    r"""Build a diagonal scale matrix from a factor specification.
+    """Build a diagonal scale matrix from a factor specification.
 
     Parameters
     ----------
@@ -411,6 +412,21 @@ def _maybe_transform_data(
     return cloned
 
 
+def _is_similarity_transform(matrix: torch.Tensor, atol: float = 1e-6) -> bool:
+    r"""Whether ``matrix`` is orthogonal up to a uniform scale (:math:`M^\top M = cI`).
+
+    Such maps -- rotations, reflections, isotropic scales, and their compositions
+    -- preserve angles. Angle-based vertex-normal weighting is therefore invariant
+    under them, so the inverse-transpose cache propagation of point normals is exact.
+    Shears and non-uniform scales fail this test.
+    """
+    n = matrix.shape[-1]
+    gram = matrix.T @ matrix
+    scale = gram.diagonal(dim1=-2, dim2=-1).mean()
+    identity = torch.eye(n, device=matrix.device, dtype=matrix.dtype)
+    return bool(torch.allclose(gram, scale * identity, atol=atol, rtol=1e-5))
+
+
 ### Public API ###
 
 
@@ -423,6 +439,9 @@ def transform(
     assume_invertible: bool | None = None,
 ) -> "Mesh":
     """Apply a linear transformation to the mesh.
+
+    Call it as ``transform(mesh, ...)`` or as ``mesh.transform(...)``. The
+    bound method supplies ``mesh`` automatically.
 
     Parameters
     ----------
@@ -476,9 +495,9 @@ def transform(
     device = mesh.points.device
     new_cache = TensorDict(
         {
-            "cell": TensorDict({}, batch_size=[mesh.n_cells]),
-            "point": TensorDict({}, batch_size=[mesh.n_points]),
-            "topology": mesh._cache.get("topology", TensorDict({})),
+            "cell": TensorDict({}, batch_size=[mesh.n_cells], device=device),
+            "point": TensorDict({}, batch_size=[mesh.n_points], device=device),
+            "topology": mesh._cache.get("topology", TensorDict({}, device=device)),
         },
         device=device,
     )
@@ -487,10 +506,11 @@ def transform(
     if matrix.shape[0] == matrix.shape[1]:
         det = matrix.det()
 
+        ### The runtime det test syncs (host readback of a cuda tensor).
         if assume_invertible is not None:
             is_invertible = assume_invertible
         else:
-            is_invertible = det.abs() > 1e-10
+            is_invertible = bool(det.abs() > 1e-10)
 
         if is_invertible:
             det_sign = det.sign()
@@ -498,29 +518,42 @@ def transform(
 
             ### Full-dimensional meshes: global area scaling
             if mesh.n_manifold_dims == mesh.n_spatial_dims:
-                if (v := mesh._cache.get(("point", "areas"), None)) is not None:
-                    new_cache["point", "areas"] = v * det_abs
                 if (v := mesh._cache.get(("cell", "areas"), None)) is not None:
                     new_cache["cell", "areas"] = v * det_abs
 
             ### Codimension-1 manifolds: per-element area scaling via normals
             # Formula: area' = area * |det(M)| * ||M^{-T} n||
             elif mesh.codimension == 1:
-                if (v := mesh._cache.get(("point", "normals"), None)) is not None:
-                    transformed = torch.linalg.solve(matrix.T, v.T).T
-                    norm_scale = transformed.norm(dim=-1)
-                    if (areas := mesh._cache.get(("point", "areas"), None)) is not None:
-                        new_cache["point", "areas"] = areas * det_abs * norm_scale
-                    new_cache["point", "normals"] = det_sign * F.normalize(
-                        transformed, dim=-1
-                    )
-
+                ### Cell (face) normals: the inverse-transpose law is exact per face.
                 if (v := mesh._cache.get(("cell", "normals"), None)) is not None:
                     transformed = torch.linalg.solve(matrix.T, v.T).T
                     norm_scale = transformed.norm(dim=-1)
                     if (areas := mesh._cache.get(("cell", "areas"), None)) is not None:
                         new_cache["cell", "areas"] = areas * det_abs * norm_scale
                     new_cache["cell", "normals"] = det_sign * F.normalize(
+                        transformed, dim=-1
+                    )
+
+                ### Vertex (point) normals are a *weighted average* of incident
+                # cell normals, so the inverse-transpose law applies to the average
+                # only when M preserves the averaging weights. Area weighting (used
+                # for 1-manifolds) is preserved under any invertible M, but the
+                # angle / angle_area weighting used for 2+ manifolds is NOT preserved
+                # by anisotropic maps (interior angles change). Only propagate when
+                # the weighting is area-based (n_manifold_dims < 2) or M is a
+                # similarity; otherwise drop the cache so point_normals recomputes
+                # lazily and correctly. (Under torch.compile we conservatively skip
+                # the similarity check -- a host sync -- and drop the cache to avoid
+                # a graph break.)
+                if (v := mesh._cache.get(("point", "normals"), None)) is not None and (
+                    mesh.n_manifold_dims < 2
+                    or (
+                        not torch.compiler.is_compiling()
+                        and _is_similarity_transform(matrix)
+                    )
+                ):
+                    transformed = torch.linalg.solve(matrix.T, v.T).T
+                    new_cache["point", "normals"] = det_sign * F.normalize(
                         transformed, dim=-1
                     )
 
@@ -564,6 +597,9 @@ def translate(
     Translation only affects point positions and centroids. Vector/tensor fields
     are unchanged by translation (they represent directions, not positions).
 
+    Call it as ``translate(mesh, ...)`` or as ``mesh.translate(...)``. The
+    bound method supplies ``mesh`` automatically.
+
     Parameters
     ----------
     mesh : Mesh
@@ -596,9 +632,9 @@ def translate(
     device = mesh.points.device
     new_cache = TensorDict(
         {
-            "cell": TensorDict({}, batch_size=[mesh.n_cells]),
-            "point": TensorDict({}, batch_size=[mesh.n_points]),
-            "topology": mesh._cache.get("topology", TensorDict({})),
+            "cell": TensorDict({}, batch_size=[mesh.n_cells], device=device),
+            "point": TensorDict({}, batch_size=[mesh.n_points], device=device),
+            "topology": mesh._cache.get("topology", TensorDict({}, device=device)),
         },
         device=device,
     )
@@ -638,6 +674,9 @@ def rotate(
     transform_global_data: bool | TensorDict = False,
 ) -> "Mesh":
     """Rotate the mesh about an axis by a specified angle.
+
+    Call it as ``rotate(mesh, ...)`` or as ``mesh.rotate(...)``. The bound
+    method supplies ``mesh`` automatically.
 
     Parameters
     ----------
@@ -718,6 +757,9 @@ def scale(
     assume_invertible: bool | None = None,
 ) -> "Mesh":
     """Scale the mesh by specified factor(s).
+
+    Call it as ``scale(mesh, ...)`` or as ``mesh.scale(...)``. The bound method
+    supplies ``mesh`` automatically.
 
     Parameters
     ----------

@@ -30,17 +30,19 @@ import logging
 from pathlib import Path
 from types import SimpleNamespace
 
+import datasets as datasets_module
 import pytest
-from omegaconf import OmegaConf
-
 from datasets import (
     ManifestSampler,
+    _build_manifest_val_dataset,
+    build_dataloaders,
+    build_dataset,
     load_manifest,
     resolve_manifest_indices,
     resolve_manifest_spec,
     validate_dataset_consistency,
 )
-
+from omegaconf import DictConfig, OmegaConf
 
 ### ---------------------------------------------------------------------------
 ### load_manifest
@@ -286,7 +288,7 @@ class TestValidateDatasetConsistency:
     def test_metrics_mismatch_warns(self, caplog):
         """Metrics mismatch is a soft drift -- warns, doesn't raise."""
         first_targets, first_metrics = self._first()
-        with caplog.at_level(logging.WARNING, logger="training.build_dataloaders"):
+        with caplog.at_level(logging.WARNING, logger="training.datasets"):
             validate_dataset_consistency(
                 ds_key="ds_b",
                 ds_targets=dict(first_targets),
@@ -388,3 +390,148 @@ class TestResolveManifestSpec:
         ds_yaml = OmegaConf.create({"train_datadir": str(tmp_path)})
         ds_block = OmegaConf.create({})
         assert resolve_manifest_spec(ds_yaml, ds_block) is None
+
+
+### ---------------------------------------------------------------------------
+### _build_manifest_val_dataset
+### ---------------------------------------------------------------------------
+
+
+class TestManifestValDataset:
+    """Tests for :func:`datasets._build_manifest_val_dataset`.
+
+    Manifest mode shares one reader across the train / val splits, so
+    validation must not inherit the train augmentations. This mirrors
+    directory mode, which always builds its val dataset with
+    ``augment=False`` -- the asymmetry these tests lock down.
+    """
+
+    @staticmethod
+    def _augmented_ds_yaml(datadir: Path) -> DictConfig:
+        """Minimal manifest-style volume dataset YAML carrying augmentations.
+
+        Trimmed to what the dataset builder inspects: the reader globs
+        paths lazily (no file is opened at construction), so the directory
+        only needs placeholder files, and the transform chain just needs a
+        ``CenterMesh`` anchor plus the augmentations that get inserted
+        after it.
+        """
+        return OmegaConf.create(
+            {
+                "pipeline": {
+                    "reader": {
+                        "_target_": "${dp:DomainMeshReader}",
+                        "path": str(datadir),
+                        "pattern": "run_*/domain_*.pdmsh",
+                    },
+                    "augmentations": [
+                        {"_target_": "${dp:RandomRotateMesh}", "axes": ["z"]},
+                        {"_target_": "${dp:RandomTranslateMesh}"},
+                    ],
+                    "transforms": [
+                        {"_target_": "${dp:CenterMesh}"},
+                    ],
+                },
+                "targets": {"pressure": "scalar"},
+            }
+        )
+
+    @staticmethod
+    def _make_datadir(tmp_path: Path) -> Path:
+        """Create placeholder runs the reader can glob (it never opens them)."""
+        for i in range(2):
+            run = tmp_path / f"run_{i}"
+            run.mkdir()
+            (run / f"domain_{i}.pdmsh").write_bytes(b"")
+        return tmp_path
+
+    def test_augment_off_returns_none(self, tmp_path: Path):
+        """``augment=False`` -> val shares the train dataset (None sentinel)."""
+        ds_yaml = self._augmented_ds_yaml(self._make_datadir(tmp_path))
+        assert (
+            _build_manifest_val_dataset(
+                ds_yaml,
+                augment=False,
+                device=None,
+                num_workers=1,
+                pin_memory=False,
+            )
+            is None
+        )
+
+    def test_augment_on_returns_unaugmented_dataset(self, tmp_path: Path):
+        """``augment=True`` -> a separate dataset whose chain has no augmentations."""
+        ds_yaml = self._augmented_ds_yaml(self._make_datadir(tmp_path))
+
+        ### Guard against a vacuous assertion: the train dataset must
+        ### actually carry a stochastic augmentation for the val check to
+        ### mean anything.
+        train_ds = build_dataset(
+            ds_yaml, augment=True, device=None, num_workers=1, pin_memory=False
+        )
+        assert any(getattr(t, "stochastic", False) for t in train_ds.transforms)
+
+        val_ds = _build_manifest_val_dataset(
+            ds_yaml, augment=True, device=None, num_workers=1, pin_memory=False
+        )
+        assert val_ds is not None
+        ### A distinct object (own reader), not the train dataset.
+        assert val_ds is not train_ds
+        ### No stochastic (augmentation) transforms survive on the val chain.
+        assert not any(getattr(t, "stochastic", False) for t in val_ds.transforms)
+        ### ...but the deterministic CenterMesh transform is still present.
+        assert any(type(t).__name__ == "CenterMesh" for t in val_ds.transforms)
+
+
+class TestMultiDatasetManifestGuard:
+    """Manifest indices must never be applied to a combined dataset."""
+
+    def test_build_dataloaders_rejects_mixed_manifest_and_directory_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The assembled loader rejects local indices on a combined dataset."""
+        roots = [tmp_path / name for name in ("manifest", "directory", "directory_val")]
+        for root in roots:
+            root.mkdir()
+            TestManifestValDataset._make_datadir(root)
+        manifest_root, directory_root, directory_val_root = roots
+        train_manifest = tmp_path / "train.txt"
+        train_manifest.write_text("run_0\n")
+        configs = {
+            "drivaer_ml_surface": OmegaConf.merge(
+                TestManifestValDataset._augmented_ds_yaml(manifest_root),
+                {"train_manifest": str(train_manifest)},
+            ),
+            "shift_suv_estate_surface": OmegaConf.merge(
+                TestManifestValDataset._augmented_ds_yaml(directory_root),
+                {"val_datadir": str(directory_val_root)},
+            ),
+        }
+
+        monkeypatch.setattr(
+            datasets_module,
+            "load_dataset_config",
+            lambda path: configs[path.stem],
+        )
+        monkeypatch.setattr(
+            datasets_module,
+            "DistributedManager",
+            lambda: SimpleNamespace(world_size=1, rank=0),
+        )
+        cfg = OmegaConf.create(
+            {
+                "dataset": "drivaer_ml_surface",
+                "extra_datasets": ["shift_suv_estate_surface"],
+                "train_split": None,
+                "val_split": None,
+                "augment": False,
+                "sampling_resolution": None,
+                "input_type": "mesh",
+                "forward_kwargs": {"domain": ""},
+                "training": {"batch_size": 1, "seed": 0},
+                "dataloader": {"num_workers": 1, "pin_memory": False},
+            }
+        )
+
+        with pytest.raises(NotImplementedError, match="multi-dataset manifest mode"):
+            build_dataloaders(cfg)

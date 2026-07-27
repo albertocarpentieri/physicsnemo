@@ -16,8 +16,13 @@ calls, and expensive geometric quantities -- centroids, normals, areas, curvatur
 
 Most mesh operations (subdivision, derivatives, transformations) are
 available both as ``Mesh`` methods and as standalone functions in the
-corresponding submodules. The methods are thin wrappers that pass ``self`` to
-the standalone functions.
+corresponding submodules. Each pair shares one canonical function, and
+normal Python descriptor binding supplies the instance as the standalone
+function's ``mesh`` argument.
+
+To construct a triangle mesh from a surface mesh whose cells are arbitrary
+polygons -- a "polygon soup" (see :doc:`tessellation`) -- use
+:meth:`Mesh.from_polygons`.
 
 .. code:: python
 
@@ -38,5 +43,21 @@ the standalone functions.
     print(mesh.point_data["T_gradient"])  # shape (3, 2)
 
 .. autoclass:: Mesh
+   :members:
+   :show-inheritance:
+
+DomainMesh
+----------
+
+.. currentmodule:: physicsnemo.mesh.domain_mesh
+
+The :class:`DomainMesh` class groups an interior mesh with named boundary
+meshes and domain-level data. Operations such as
+:meth:`~physicsnemo.mesh.domain_mesh.DomainMesh.morph` and
+:meth:`~physicsnemo.mesh.domain_mesh.DomainMesh.radial_basis_function_deform`
+apply one consistent geometry change to every component and return a new
+domain.
+
+.. autoclass:: DomainMesh
    :members:
    :show-inheritance:
